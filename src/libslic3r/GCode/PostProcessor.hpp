@@ -2,11 +2,44 @@
 #define slic3r_GCode_PostProcessor_hpp_
 
 #include <string>
+#include <vector>
+#include <optional>
 
 #include "../libslic3r.h"
 #include "../PrintConfig.hpp"
 
+#include <boost/regex.hpp>
+
 namespace Slic3r {
+
+// Parsed substitution rule — shared between streaming (line-level) and
+// full-file (multiline) processing paths.
+struct GCodeSubRule
+{
+    bool        is_regex;
+    std::string find;
+    std::string replace;
+    // Flags needed at runtime for literal substitution and format bitmask.
+    bool case_insensitive  = false;
+    bool format_first_only = false;
+    // True when this rule requires full-file processing (multiline flag set
+    // or find/replace contain newlines that would break the streaming loop).
+    bool needs_multiline   = false;
+    // Pre-compiled regex — set during parsing to avoid per-line compilation.
+    std::optional<boost::regex> compiled_regex;
+};
+
+// Parse the raw substitution config options into a vector of GCodeSubRule.
+// When multiline is true, only rules with 'm' flag or containing \n/\r are
+// returned (these require full-file processing). When multiline is false,
+// only line-level rules are returned (for streaming).
+// Returns an empty vector when no rules are defined.
+extern std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &config, bool target_multiline);
+
+// Apply a single line-level substitution rule to a single gcode line.
+// Returns true if the line was modified.
+// Only rules without the 'm' (multiline) flag should be passed here.
+extern bool apply_gcode_substitution_line(GCodeSubRule &rule, std::string &line);
 
 // Run post processing script / scripts if defined.
 // Returns true if a post-processing script was executed.
@@ -38,7 +71,7 @@ inline bool run_post_process_scripts(std::string &src_path, const DynamicPrintCo
 // Returns true if substitutions were applied.
 // Returns false if no gcode_substitutions were defined.
 // Throws an exception on error.
-extern bool apply_gcode_substitutions(std::string &src_path, const DynamicPrintConfig &config);
+extern bool apply_gcode_substitutions(std::string &src_path, std::vector<GCodeSubRule> &&all_rules);
 
 // Combined post-processor: applies substitutions then runs scripts.
 // If make_copy and either feature is active, creates a .pp copy to protect

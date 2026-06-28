@@ -225,14 +225,11 @@ void gcode_add_line_number(const std::string& path, const DynamicPrintConfig& co
     fs.close();
 }
 
-// Apply sed-like regex/literal substitutions to the G-code file in-place.
-// Uses a ping-pong dual-buffer to avoid per-rule full-string allocations.
-// Must be called before run_post_process_scripts() so external scripts
-// see the substituted content.
-// Returns true if substitutions were defined and processed.
-// Returns false if no gcode_substitutions were defined.
-// Throws an exception on error.
-bool apply_gcode_substitutions(std::string &src_path, const DynamicPrintConfig &config)
+// ---------------------------------------------------------------------------
+// Shared rule parsing and line-level substitution
+// ---------------------------------------------------------------------------
+
+std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &config, bool target_multiline)
 {
     const auto *print_subs   = config.opt<ConfigOptionStrings>("gcode_substitutions");
     const auto *printer_subs = config.opt<ConfigOptionStrings>("printer_gcode_substitutions");
@@ -241,27 +238,209 @@ bool apply_gcode_substitutions(std::string &src_path, const DynamicPrintConfig &
     bool has_printer_subs = printer_subs != nullptr && !printer_subs->values.empty();
 
     if (!has_print_subs && !has_printer_subs)
-        return false;
+        return {};
 
-    // Collect and expand all lines from both config sources.
-    // The GUI stores multiline text in a single vector element with embedded \r\n.
-    // We must split each element by newlines to get individual substitution rules.
-    std::vector<std::string> rules;
-    auto expand_rules = [&rules](const ConfigOptionStrings* subs) {
+    std::vector<GCodeSubRule> rules;
+
+    // Explicitly capture target_multiline to avoid scoping isolation
+    auto expand_rules = [&rules, target_multiline](const ConfigOptionStrings* subs) {
         for (const auto& raw_value : subs->values) {
             std::vector<std::string> lines;
             boost::split(lines, raw_value, boost::is_any_of("\r\n"), boost::token_compress_on);
             for (auto &line : lines) {
                 boost::trim(line);
-                if (!line.empty())
-                    rules.push_back(line);
+                if (line.empty() || line.size() < 4 || (line[0] != 's' && line[0] != 'l'))
+                    continue;
+
+                GCodeSubRule rule;
+                rule.is_regex  = line[0] == 's';
+                char delimiter = line[1];
+
+                // Split by delimiter using string_view to avoid small heap allocations.
+                std::vector<std::string_view> parts;
+                {
+                    std::string_view sv(line);
+                    std::string_view::size_type pos   = 2;
+                    std::string_view::size_type start = pos;
+                    int part_count = 0;
+                    while (part_count < 3) {
+                        pos = sv.find(delimiter, start);
+                        if (pos == std::string_view::npos) {
+                            parts.push_back(sv.substr(start));
+                            break;
+                        }
+                        parts.push_back(sv.substr(start, pos - start));
+                        start = pos + 1;
+                        part_count++;
+                    }
+                }
+                if (parts.size() < 2)
+                    continue;
+
+                rule.find    = std::string(parts[0]);
+                rule.replace = std::string(parts[1]);
+                std::string flags = parts.size() > 2 ? std::string(parts[2]) : "";
+
+                if (rule.find.empty()) {
+                    BOOST_LOG_TRIVIAL(warning) << "GCode substitution skipped: empty find pattern in: " << line;
+                    continue;
+                }
+
+                // Parse flags — regex-only flags are local (baked into compiled_regex at parse time).
+                bool has_m_flag        = flags.find('m') != std::string::npos;
+
+                // Determine multiline requirement early — before regex compilation —
+                // so incompatible rules are skipped without the compilation cost.
+                rule.needs_multiline = has_m_flag ||
+                    rule.find.find('\n') != std::string::npos ||
+                    rule.find.find('\r') != std::string::npos ||
+                    rule.replace.find('\n') != std::string::npos ||
+                    rule.replace.find('\r') != std::string::npos;
+                // Drop rules that are not applicable for this call.
+                if (target_multiline && !rule.needs_multiline)
+                    continue;
+                if (!target_multiline && rule.needs_multiline)
+                    continue;
+                
+                bool case_insensitive  = flags.find('i') != std::string::npos;
+                bool no_sub_match      = flags.find('n') != std::string::npos;
+                bool collate           = flags.find('c') != std::string::npos;
+                bool match_newline     = flags.find('s') != std::string::npos;
+                bool format_first_only = flags.find('f') != std::string::npos;
+
+                // case_insensitive is needed at runtime for literal substitution.
+                rule.case_insensitive  = case_insensitive;
+                rule.format_first_only = format_first_only;
+
+                // Pre-compile regex at parse time to avoid per-line compilation.
+                if (rule.is_regex) {
+                    std::string pattern = match_newline ? "(?s)" + rule.find : rule.find;
+                    boost::regex::flag_type syntax_flags = boost::regex::normal;
+                    if (case_insensitive) syntax_flags |= boost::regex::icase;
+                    if (no_sub_match)     syntax_flags |= boost::regex::no_sub_match;
+                    if (collate)          syntax_flags |= boost::regex::collate;
+                    if (has_m_flag)       syntax_flags |= boost::regex::multiline;
+                    try {
+                        rule.compiled_regex = boost::regex(pattern, syntax_flags);
+                    } catch (const boost::regex_error &re_err) {
+                        throw Slic3r::RuntimeError(Slic3r::format(
+                            "GCode substitution failed. Invalid regex in rule: %1%\nError: %2%", rule.find, re_err.what()));
+                    }
+                }
+                BOOST_LOG_TRIVIAL(debug) << "Parsed substitution rule: is_regex=" << rule.is_regex
+                    << " case_insensitive=" << rule.case_insensitive
+                    << " needs_multiline=" << rule.needs_multiline
+                    << " format_first_only=" << rule.format_first_only
+                    << " find=" << rule.find;
+                rules.push_back(std::move(rule));
             }
         }
     };
+
     if (has_print_subs)   expand_rules(print_subs);
     if (has_printer_subs) expand_rules(printer_subs);
 
-    if (rules.empty())
+    BOOST_LOG_TRIVIAL(debug) << "parse_gcode_substitution_rules: multiline=" << target_multiline
+        << " rules_count=" << rules.size();
+    return rules;
+}
+
+// Apply a single substitution rule to a single gcode line (streaming, no full-file load).
+// Only rules without the 'm' (multiline) flag should be passed here.
+// Returns true if the line was modified.
+bool apply_gcode_substitution_line(GCodeSubRule &rule, std::string &line)
+{
+    if (rule.needs_multiline)
+        return false; // multiline/newline rules require full-file context
+
+    if (rule.is_regex) {
+        // Use pre-compiled regex from parse time.
+        if (!rule.compiled_regex)
+            return false; // invalid regex, already warned at parse time
+
+        if (!boost::regex_search(line, *rule.compiled_regex))
+            return false;
+
+        // Build format flags bitmask.
+        boost::match_flag_type format_flags = boost::regex_constants::format_default;
+        if (rule.format_first_only) format_flags |= boost::regex_constants::format_first_only;
+
+        std::string result;
+        result.reserve(line.size());
+        boost::regex_replace(
+            std::back_inserter(result),
+            line.begin(), line.end(),
+            *rule.compiled_regex, rule.replace, format_flags
+        );
+        line = std::move(result);
+        return true;
+    }
+
+    // Literal substitution — support i (case-insensitive) and f (first only) flags.
+    size_t pos = 0;
+    bool literal_match_found = false;
+    std::string result;
+    
+    while (true) {
+        size_t found_pos = std::string::npos;
+
+        if (rule.case_insensitive) {
+            auto it = boost::ifind_first(
+                boost::make_iterator_range(line.begin() + pos, line.end()), rule.find);
+            if (it) {
+                found_pos = static_cast<size_t>(std::distance(line.begin(), it.begin()));
+            }
+        } else {
+            found_pos = line.find(rule.find, pos);
+        }
+
+        if (found_pos == std::string::npos)
+            break;
+
+        if (!literal_match_found) {
+            literal_match_found = true;
+            // Allocate result buffer only when a match is confirmed.
+            result.reserve(line.size() + rule.replace.size());
+            result.append(line, 0, found_pos);
+            result.append(rule.replace);
+            pos = found_pos + rule.find.length();
+
+            if (rule.format_first_only) {
+                result.append(line, pos, std::string::npos);
+                line = std::move(result);
+                return true;
+            }
+            continue;
+        }
+
+        // Subsequent matches — append to already-allocated result.
+        result.append(line, pos, found_pos - pos);
+        result.append(rule.replace);
+        pos = found_pos + rule.find.length();
+    }
+
+    if (!literal_match_found)
+        return false; // no match found
+
+    result.append(line, pos, std::string::npos);
+    line = std::move(result);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Full-file (multiline) substitution — only for rules with 'm' flag
+// ---------------------------------------------------------------------------
+
+// Apply sed-like regex/literal substitutions to the G-code file in-place.
+// Uses a ping-pong dual-buffer to avoid per-rule full-string allocations.
+// Must be called before run_post_process_scripts() so external scripts
+// see the substituted content.
+// Returns true if substitutions were defined and processed.
+// Returns false if no gcode_substitutions were defined.
+// Throws an exception on error.
+bool apply_gcode_substitutions(std::string &src_path, std::vector<GCodeSubRule> &&all_rules)
+{
+    if (all_rules.empty())
         return false;
 
     try {
@@ -292,80 +471,20 @@ bool apply_gcode_substitutions(std::string &src_path, const DynamicPrintConfig &
         std::string* current_source = &gcode;
         std::string* current_target = &alt_gcode;
 
-        // Helper lambda to process a single substitution rule
-        auto process_sub = [&current_source, &current_target, &modified](const std::string& sub_str) {
-            if (sub_str.size() < 4 || (sub_str[0] != 's' && sub_str[0] != 'l'))
-                return;
-
-            bool        is_regex   = sub_str[0] == 's';
-            char        delimiter  = sub_str[1];
-
-            // Split by delimiter using string_view to avoid small heap allocations.
-            std::vector<std::string_view> parts;
-            {
-                std::string_view sv(sub_str);
-                std::string_view::size_type pos   = 2; // skip command and delimiter
-                std::string_view::size_type start = pos;
-                int part_count = 0;
-                while (part_count < 3) {
-                    pos = sv.find(delimiter, start);
-                    if (pos == std::string_view::npos) {
-                        parts.push_back(sv.substr(start));
-                        break;
-                    }
-                    parts.push_back(sv.substr(start, pos - start));
-                    start = pos + 1;
-                    part_count++;
-                }
-            }
-            if (parts.size() < 2)
-                return;
-
-            // Convert to std::string for Boost regex / literal search.
-            std::string find(parts[0]);
-            std::string replace(parts[1]);
-            std::string flags = parts.size() > 2 ? std::string(parts[2]) : "";
-
-            // Guard against empty search patterns to prevent hard locks or crashes
-            if (find.empty()) {
-                BOOST_LOG_TRIVIAL(warning) << "GCode substitution skipped: empty find pattern in: " << sub_str;
-                return;
-            }
-
-            // Parse flags
-            bool case_insensitive  = flags.find('i') != std::string::npos;
-            bool no_sub_match      = flags.find('n') != std::string::npos;
-            bool collate           = flags.find('c') != std::string::npos;
-            bool multiline         = flags.find('m') != std::string::npos;
-            bool match_newline     = flags.find('s') != std::string::npos;
-            bool format_first_only = flags.find('f') != std::string::npos;
-
-            if (is_regex) {
-                // (?s) makes . match newlines — inline modifier, not a syntax flag
-                std::string pattern = match_newline ? "(?s)" + find : find;
-
-                // Build syntax flags bitmask
-                boost::regex::flag_type syntax_flags = boost::regex::normal;
-                if (case_insensitive) syntax_flags |= boost::regex::icase;
-                if (no_sub_match)     syntax_flags |= boost::regex::no_sub_match;
-                if (collate)          syntax_flags |= boost::regex::collate;
-                if (multiline)        syntax_flags |= boost::regex::multiline;
-
-                boost::regex re;
-                try {
-                    re = boost::regex(pattern, syntax_flags);
-                } catch (const boost::regex_error &re_err) {
-                    throw Slic3r::RuntimeError(Slic3r::format(
-                        "GCode substitution failed. Invalid regex in rule: %1%\nError: %2%", sub_str, re_err.what()));
-                }
+        // Process each multiline substitution rule using the pre-parsed GCodeSubRule.
+        for (auto &rule : all_rules) {
+            if (rule.is_regex) {
+                // Use pre-compiled regex from parse time.
+                if (!rule.compiled_regex)
+                    continue; // invalid regex, already warned at parse time
 
                 // Check first — zero copy penalty if no match.
-                if (!boost::regex_search(*current_source, re))
-                    return;
+                if (!boost::regex_search(*current_source, *rule.compiled_regex))
+                    continue;
 
                 // Build format flags bitmask
                 boost::match_flag_type format_flags = boost::regex_constants::format_default;
-                if (format_first_only) format_flags |= boost::regex_constants::format_first_only;
+                if (rule.format_first_only) format_flags |= boost::regex_constants::format_first_only;
 
                 modified = true;
 
@@ -377,7 +496,7 @@ bool apply_gcode_substitutions(std::string &src_path, const DynamicPrintConfig &
                 boost::regex_replace(
                     std::back_inserter(*current_target),
                     current_source->begin(), current_source->end(),
-                    re, replace, format_flags
+                    *rule.compiled_regex, rule.replace, format_flags
                 );
 
                 // Zero-allocation buffer swap: target becomes source for next rule.
@@ -390,14 +509,14 @@ bool apply_gcode_substitutions(std::string &src_path, const DynamicPrintConfig &
                 while (true) {
                     size_t found_pos = std::string::npos;
 
-                    if (case_insensitive) {
+                    if (rule.case_insensitive) {
                         auto it = boost::ifind_first(
-                            boost::make_iterator_range(current_source->begin() + pos, current_source->end()), find);
+                            boost::make_iterator_range(current_source->begin() + pos, current_source->end()), rule.find);
                         if (it) {
                             found_pos = static_cast<size_t>(std::distance(current_source->begin(), it.begin()));
                         }
                     } else {
-                        found_pos = current_source->find(find, pos);
+                        found_pos = current_source->find(rule.find, pos);
                     }
 
                     if (found_pos == std::string::npos)
@@ -412,11 +531,11 @@ bool apply_gcode_substitutions(std::string &src_path, const DynamicPrintConfig &
 
                     // Push unchanged chunk preceding the match, then the replacement.
                     current_target->append(*current_source, pos, found_pos - pos);
-                    current_target->append(replace);
+                    current_target->append(rule.replace);
 
-                    pos = found_pos + find.length();
+                    pos = found_pos + rule.find.length();
 
-                    if (format_first_only)
+                    if (rule.format_first_only)
                         break;
                 }
 
@@ -426,11 +545,7 @@ bool apply_gcode_substitutions(std::string &src_path, const DynamicPrintConfig &
                     std::swap(current_source, current_target);
                 }
             }
-        };
-
-        // Process all substitution rules using the ping-pong pointer tracking loop.
-        for (const auto& rule : rules)
-            process_sub(rule);
+        }
 
         // Only write back to disk if content actually changed — avoids unnecessary I/O and timestamp changes.
         if (modified) {
@@ -452,23 +567,29 @@ bool apply_gcode_substitutions(std::string &src_path, const DynamicPrintConfig &
 }
 
 // Combined post-processor: applies substitutions then runs scripts.
+// Line-level substitution rules (without 'm' flag) are already applied during
+// the streaming GCodeProcessor::run_post_process() loop. Only multiline rules
+// (with 'm' flag) require the full-file apply_gcode_substitutions() pass here.
 // If make_copy and either feature is active, creates a .pp copy to protect
 // the memory-mapped previewer handle. Returns true if any post-processing
 // work was done (caller must delete the .pp temp file when make_copy=true).
 bool run_post_process(std::string &src_path, bool make_copy, const std::string &host, std::string &output_name, const DynamicPrintConfig &config)
 {
-    const auto *print_subs   = config.opt<ConfigOptionStrings>("gcode_substitutions");
-    const auto *printer_subs = config.opt<ConfigOptionStrings>("printer_gcode_substitutions");
     const auto *post_process = config.opt<ConfigOptionStrings>("post_process");
 
-    bool has_subs    = (print_subs != nullptr && !print_subs->values.empty()) ||
-                       (printer_subs != nullptr && !printer_subs->values.empty());
+    // Parse multiline rules — line-level rules are handled in the streaming
+    // GCodeProcessor loop.
+    auto multiline_rules = parse_gcode_substitution_rules(config, true);
     bool has_scripts = post_process != nullptr && !post_process->values.empty();
 
-    if (!has_subs && !has_scripts)
+    if (multiline_rules.empty() && !has_scripts)
         return false;
 
-    if (make_copy && (has_subs || has_scripts)) {
+    BOOST_LOG_TRIVIAL(debug) << "run_post_process: make_copy=" << make_copy
+        << " multiline_rules_count=" << multiline_rules.size()
+        << " has_scripts=" << has_scripts;
+
+    if (make_copy && (!multiline_rules.empty() || has_scripts)) {
         // Create an isolated temporary file to protect the active memory-mapped previewer handle.
         std::string path = src_path + ".pp";
         try {
@@ -486,9 +607,9 @@ bool run_post_process(std::string &src_path, bool make_copy, const std::string &
     }
 
     try {
-        // 1. Apply substitutions
-        if (has_subs)
-            apply_gcode_substitutions(src_path, config);
+        // 1. Apply multiline substitutions (line-level already done in streaming loop).
+        //    apply_gcode_substitutions returns false if no multiline rules.
+        apply_gcode_substitutions(src_path, std::move(multiline_rules));
 
         // 2. Run post-processing scripts (make_copy = false since we already handled isolation)
         if (has_scripts)
