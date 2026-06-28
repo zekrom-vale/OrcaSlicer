@@ -2034,6 +2034,61 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionString("M104 S0 ; turn off temperature\nG28 X0  ; home X axis\nM84     ; disable motors\n"));
 
+    def = this->add("gcode_substitutions", coStrings);
+    def->label = L("G-code Substitutions");
+    def->tooltip = L("Sed-like regex/literal substitutions applied to G-code before post-processing scripts.\n\n"
+                     "Each line: s/find/replace/flags  (regex) or  l/find/replace/flags  (literal)\n\n"
+                     "Delimiter can be any character after s or l. Choose a delimiter that does not appear\n"
+                     "in the pattern or replacement string. There is no escape mechanism for the delimiter.\n"
+                     "  e.g.: s@G1@G0@i  or  s#OLD#NEW#  or  s|find|replace|i\n\n"
+                     "Syntax Flags: i = case-insensitive, n = no-sub-match, c = collate, m = multiline\n"
+                     "Inline Modifier: s = match-newline (?s)\n"
+                     "Format Flags: f = format-first-only (replace first match only)\n\n"
+                     "Capture groups use ${1}, ${2}, ${3}, etc in the replacement string.\n\n"
+                     "Comments: anything after the 4th delimiter is ignored (useful for inline documentation).\n\n"
+                     "Examples:\n"
+                     "  s/G1 F/G0 F/i/                    Replace G1 with G0, case-insensitive\n"
+                     "  l/M104/M109//                     Literal replace M104 with M109\n"
+                     "  s/M109 S[0-9]+/M109 S200/f/       Replace first M109 temp set to 200\n"
+                     "  s@G1 E-@G1 E@i@                   Replace retract moves\n"
+                     "  s@(;TYPE:Top solid infill)@${1}M221 S98@s@  Increase top infill flow to 98%\n"
+                     "  s@M221 S95@M221 S100@f@           Replace first occurrence of 95% flow with 100%\n"
+                     "  s@; filament_colour_type = ([0-9]+);([0-9]+);([0-9]+);([0-9]+)@; filament_color_type: [\"${1}\", \"${2}\", \"${3}\", \"${4}\"]@@  Convert filament colour format");
+    def->gui_flags = "serialized";
+    def->multiline = true;
+    def->full_width = true;
+    def->height = 6;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionStrings());
+
+    def = this->add("printer_gcode_substitutions", coStrings);
+    def->label = L("Printer G-code Substitutions");
+    def->tooltip = L("Printer-level sed-like regex/literal substitutions applied to G-code before post-processing scripts.\n"
+                     "These run after print-level substitutions, allowing printer-specific hardware workarounds.\n\n"
+                     "Each line: s/find/replace/flags  (regex) or  l/find/replace/flags  (literal)\n\n"
+                     "Delimiter can be any character after s or l. Choose a delimiter that does not appear\n"
+                     "in the pattern or replacement string. There is no escape mechanism for the delimiter.\n"
+                     "  e.g.: s@G1@G0@i  or  s#OLD#NEW#  or  s|find|replace|i\n\n"
+                     "Syntax Flags: i = case-insensitive, n = no-sub-match, c = collate, m = multiline\n"
+                     "Inline Modifier: s = match-newline (?s)\n"
+                     "Format Flags: f = format-first-only (replace first match only)\n\n"
+                     "Capture groups use ${1}, ${2}, ${3}, etc in the replacement string.\n\n"
+                     "Comments: anything after the 4th delimiter is ignored (useful for inline documentation).\n\n"
+                     "Examples:\n"
+                     "  s/G1 F/G0 F/i/                    Replace G1 with G0, case-insensitive\n"
+                     "  l/M104/M109//                     Literal replace M104 with M109\n"
+                     "  s/M109 S[0-9]+/M109 S200/f/       Replace first M109 temp set to 200\n"
+                     "  s@G1 E-@G1 E@i@                   Replace retract moves\n"
+                     "  s@(;TYPE:Top solid infill)@${1}M221 S98@s@  Increase top infill flow to 98%\n"
+                     "  s@M221 S95@M221 S100@f@           Replace first occurrence of 95% flow with 100%\n"
+                     "  s@; filament_colour_type = ([0-9]+);([0-9]+);([0-9]+);([0-9]+)@; filament_color_type: [\"${1}\", \"${2}\", \"${3}\", \"${4}\"]@@  Convert filament colour format");
+    def->gui_flags = "serialized";
+    def->multiline = true;
+    def->full_width = true;
+    def->height = 6;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionStrings());
+
     def             = this->add("printing_by_object_gcode", coString);
     def->label      = L("Between Object G-code");
     def->tooltip    = L("Insert G-code between objects. This parameter will only come into effect when you print your models object by object.");

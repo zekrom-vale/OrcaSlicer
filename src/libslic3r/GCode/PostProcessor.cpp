@@ -225,6 +225,291 @@ void gcode_add_line_number(const std::string& path, const DynamicPrintConfig& co
     fs.close();
 }
 
+// Apply sed-like regex/literal substitutions to the G-code file in-place.
+// Uses a ping-pong dual-buffer to avoid per-rule full-string allocations.
+// Must be called before run_post_process_scripts() so external scripts
+// see the substituted content.
+// Returns true if substitutions were defined and processed.
+// Returns false if no gcode_substitutions were defined.
+// Throws an exception on error.
+bool apply_gcode_substitutions(std::string &src_path, const DynamicPrintConfig &config)
+{
+    const auto *print_subs   = config.opt<ConfigOptionStrings>("gcode_substitutions");
+    const auto *printer_subs = config.opt<ConfigOptionStrings>("printer_gcode_substitutions");
+
+    bool has_print_subs   = print_subs != nullptr && !print_subs->values.empty();
+    bool has_printer_subs = printer_subs != nullptr && !printer_subs->values.empty();
+
+    if (!has_print_subs && !has_printer_subs)
+        return false;
+
+    // Collect and expand all lines from both config sources.
+    // The GUI stores multiline text in a single vector element with embedded \r\n.
+    // We must split each element by newlines to get individual substitution rules.
+    std::vector<std::string> rules;
+    auto expand_rules = [&rules](const ConfigOptionStrings* subs) {
+        for (const auto& raw_value : subs->values) {
+            std::vector<std::string> lines;
+            boost::split(lines, raw_value, boost::is_any_of("\r\n"), boost::token_compress_on);
+            for (auto &line : lines) {
+                boost::trim(line);
+                if (!line.empty())
+                    rules.push_back(line);
+            }
+        }
+    };
+    if (has_print_subs)   expand_rules(print_subs);
+    if (has_printer_subs) expand_rules(printer_subs);
+
+    if (rules.empty())
+        return false;
+
+    try {
+        // Read the entire G-code file into primary memory buffer.
+        std::string gcode;
+        {
+            FilePtr in{ boost::nowide::fopen(src_path.c_str(), "rb") };
+            if (in.f == nullptr)
+                throw Slic3r::RuntimeError(Slic3r::format("GCode substitution failed. Cannot open file for reading: %1%", src_path));
+
+            std::error_code ec;
+            auto size = boost::filesystem::file_size(src_path, ec);
+            if (ec)
+                throw Slic3r::RuntimeError(Slic3r::format("GCode substitution failed. Cannot determine file size: %1%", src_path));
+
+            gcode.resize(size);
+            size_t cnt_read = ::fread(gcode.data(), 1, size, in.f);
+            if (::ferror(in.f))
+                throw Slic3r::RuntimeError(Slic3r::format("GCode substitution failed. Error reading file: %1%", src_path));
+            gcode.resize(cnt_read);
+        }
+
+        // Allocate exactly one secondary scratch buffer for ping-pong swapping.
+        std::string alt_gcode;
+        bool modified = false;
+
+        // Pointers track which buffer holds the current "source" data.
+        std::string* current_source = &gcode;
+        std::string* current_target = &alt_gcode;
+
+        // Helper lambda to process a single substitution rule
+        auto process_sub = [&current_source, &current_target, &modified](const std::string& sub_str) {
+            if (sub_str.size() < 4 || (sub_str[0] != 's' && sub_str[0] != 'l'))
+                return;
+
+            bool        is_regex   = sub_str[0] == 's';
+            char        delimiter  = sub_str[1];
+
+            // Split by delimiter using string_view to avoid small heap allocations.
+            std::vector<std::string_view> parts;
+            {
+                std::string_view sv(sub_str);
+                std::string_view::size_type pos   = 2; // skip command and delimiter
+                std::string_view::size_type start = pos;
+                int part_count = 0;
+                while (part_count < 3) {
+                    pos = sv.find(delimiter, start);
+                    if (pos == std::string_view::npos) {
+                        parts.push_back(sv.substr(start));
+                        break;
+                    }
+                    parts.push_back(sv.substr(start, pos - start));
+                    start = pos + 1;
+                    part_count++;
+                }
+            }
+            if (parts.size() < 2)
+                return;
+
+            // Convert to std::string for Boost regex / literal search.
+            std::string find(parts[0]);
+            std::string replace(parts[1]);
+            std::string flags = parts.size() > 2 ? std::string(parts[2]) : "";
+
+            // Guard against empty search patterns to prevent hard locks or crashes
+            if (find.empty()) {
+                BOOST_LOG_TRIVIAL(warning) << "GCode substitution skipped: empty find pattern in: " << sub_str;
+                return;
+            }
+
+            // Parse flags
+            bool case_insensitive  = flags.find('i') != std::string::npos;
+            bool no_sub_match      = flags.find('n') != std::string::npos;
+            bool collate           = flags.find('c') != std::string::npos;
+            bool multiline         = flags.find('m') != std::string::npos;
+            bool match_newline     = flags.find('s') != std::string::npos;
+            bool format_first_only = flags.find('f') != std::string::npos;
+
+            if (is_regex) {
+                // (?s) makes . match newlines — inline modifier, not a syntax flag
+                std::string pattern = match_newline ? "(?s)" + find : find;
+
+                // Build syntax flags bitmask
+                boost::regex::flag_type syntax_flags = boost::regex::normal;
+                if (case_insensitive) syntax_flags |= boost::regex::icase;
+                if (no_sub_match)     syntax_flags |= boost::regex::no_sub_match;
+                if (collate)          syntax_flags |= boost::regex::collate;
+                if (multiline)        syntax_flags |= boost::regex::multiline;
+
+                boost::regex re;
+                try {
+                    re = boost::regex(pattern, syntax_flags);
+                } catch (const boost::regex_error &re_err) {
+                    throw Slic3r::RuntimeError(Slic3r::format(
+                        "GCode substitution failed. Invalid regex in rule: %1%\nError: %2%", sub_str, re_err.what()));
+                }
+
+                // Check first — zero copy penalty if no match.
+                if (!boost::regex_search(*current_source, re))
+                    return;
+
+                // Build format flags bitmask
+                boost::match_flag_type format_flags = boost::regex_constants::format_default;
+                if (format_first_only) format_flags |= boost::regex_constants::format_first_only;
+
+                modified = true;
+
+                // Clear and reserve the target buffer to avoid reallocation.
+                current_target->clear();
+                current_target->reserve(current_source->size());
+
+                // Stream replacement directly into target via back_inserter — no intermediate string.
+                boost::regex_replace(
+                    std::back_inserter(*current_target),
+                    current_source->begin(), current_source->end(),
+                    re, replace, format_flags
+                );
+
+                // Zero-allocation buffer swap: target becomes source for next rule.
+                std::swap(current_source, current_target);
+            } else {
+                // Literal substitution — support i (case-insensitive) and f (first only) flags.
+                size_t pos = 0;
+                bool literal_match_found = false;
+
+                while (true) {
+                    size_t found_pos = std::string::npos;
+
+                    if (case_insensitive) {
+                        auto it = boost::ifind_first(
+                            boost::make_iterator_range(current_source->begin() + pos, current_source->end()), find);
+                        if (it) {
+                            found_pos = static_cast<size_t>(std::distance(current_source->begin(), it.begin()));
+                        }
+                    } else {
+                        found_pos = current_source->find(find, pos);
+                    }
+
+                    if (found_pos == std::string::npos)
+                        break;
+
+                    if (!literal_match_found) {
+                        literal_match_found = true;
+                        modified = true;
+                        current_target->clear();
+                        current_target->reserve(current_source->size());
+                    }
+
+                    // Push unchanged chunk preceding the match, then the replacement.
+                    current_target->append(*current_source, pos, found_pos - pos);
+                    current_target->append(replace);
+
+                    pos = found_pos + find.length();
+
+                    if (format_first_only)
+                        break;
+                }
+
+                if (literal_match_found) {
+                    // Append remaining file contents after the final match.
+                    current_target->append(*current_source, pos, std::string::npos);
+                    std::swap(current_source, current_target);
+                }
+            }
+        };
+
+        // Process all substitution rules using the ping-pong pointer tracking loop.
+        for (const auto& rule : rules)
+            process_sub(rule);
+
+        // Only write back to disk if content actually changed — avoids unnecessary I/O and timestamp changes.
+        if (modified) {
+            FilePtr out{ boost::nowide::fopen(src_path.c_str(), "wb") };
+            if (out.f == nullptr)
+                throw Slic3r::RuntimeError(Slic3r::format("GCode substitution failed. Cannot open file for writing: %1%", src_path));
+
+            // current_source points to whichever buffer holds the final data.
+            size_t cnt_written = ::fwrite(current_source->data(), 1, current_source->size(), out.f);
+            if (::ferror(out.f) || cnt_written != current_source->size())
+                throw Slic3r::RuntimeError(Slic3r::format("GCode substitution failed. Error writing file: %1%", src_path));
+        }
+    } catch (const std::exception &err) {
+        BOOST_LOG_TRIVIAL(error) << "Exception caught during GCode substitution: " << err.what();
+        throw;
+    }
+
+    return true;
+}
+
+// Combined post-processor: applies substitutions then runs scripts.
+// If make_copy and either feature is active, creates a .pp copy to protect
+// the memory-mapped previewer handle. Returns true if any post-processing
+// work was done (caller must delete the .pp temp file when make_copy=true).
+bool run_post_process(std::string &src_path, bool make_copy, const std::string &host, std::string &output_name, const DynamicPrintConfig &config)
+{
+    const auto *print_subs   = config.opt<ConfigOptionStrings>("gcode_substitutions");
+    const auto *printer_subs = config.opt<ConfigOptionStrings>("printer_gcode_substitutions");
+    const auto *post_process = config.opt<ConfigOptionStrings>("post_process");
+
+    bool has_subs    = (print_subs != nullptr && !print_subs->values.empty()) ||
+                       (printer_subs != nullptr && !printer_subs->values.empty());
+    bool has_scripts = post_process != nullptr && !post_process->values.empty();
+
+    if (!has_subs && !has_scripts)
+        return false;
+
+    if (make_copy && (has_subs || has_scripts)) {
+        // Create an isolated temporary file to protect the active memory-mapped previewer handle.
+        std::string path = src_path + ".pp";
+        try {
+            if (boost::filesystem::exists(path))
+                boost::filesystem::remove(path);
+        } catch (const std::exception &err) {
+            BOOST_LOG_TRIVIAL(error) << Slic3r::format("Failed deleting an old temporary file %1% before substitutions/post-processing: %2%", path, err.what());
+        }
+
+        std::string error_message;
+        if (copy_file(src_path, path, error_message, false) != SUCCESS)
+            throw Slic3r::RuntimeError(Slic3r::format("Failed making a temporary copy of G-code file %1% before substitutions/post-processing: %2%", src_path, error_message));
+
+        src_path = std::move(path);
+    }
+
+    try {
+        // 1. Apply substitutions
+        if (has_subs)
+            apply_gcode_substitutions(src_path, config);
+
+        // 2. Run post-processing scripts (make_copy = false since we already handled isolation)
+        if (has_scripts)
+            run_post_process_scripts(src_path, false, host, output_name, config);
+    } catch (...) {
+        // Clean up the .pp temp file on error to prevent dangling files
+        if (make_copy) {
+            try {
+                if (boost::filesystem::exists(src_path))
+                    boost::filesystem::remove(src_path);
+            } catch (const std::exception &err) {
+                BOOST_LOG_TRIVIAL(error) << Slic3r::format("Failed deleting temporary G-code file %1% on error: %2%", src_path, err.what());
+            }
+        }
+        throw;
+    }
+
+    return true;
+}
+
+
 // Run post processing script / scripts if defined.
 // Returns true if a post-processing script was executed.
 // Returns false if no post-processing script was defined.

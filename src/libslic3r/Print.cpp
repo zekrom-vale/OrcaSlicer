@@ -122,6 +122,8 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "printing_by_object_gcode",
         "filament_end_gcode",
         "post_process",
+        "gcode_substitutions",
+        "printer_gcode_substitutions",
         "extruder_clearance_height_to_rod",
         "extruder_clearance_height_to_lid",
         "extruder_clearance_radius",
