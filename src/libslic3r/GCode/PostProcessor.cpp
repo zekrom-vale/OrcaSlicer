@@ -226,6 +226,47 @@ void gcode_add_line_number(const std::string& path, const DynamicPrintConfig& co
 }
 
 // ---------------------------------------------------------------------------
+// Escape processing infrastructure
+// ---------------------------------------------------------------------------
+
+// Sentinel characters used to protect escaped braces during escape processing.
+// These are chosen from the control character range and should not appear in
+// normal GCode content.
+static constexpr char OPEN_BRACE_SENTINEL  = '\x01';
+static constexpr char CLOSE_BRACE_SENTINEL = '\x02';
+
+// Resolve C-style escape sequences in a string.
+// Processes: \n (newline), \r (carriage return), \t (tab), \\ (backslash),
+//           \" (double quote), \' (single quote).
+// Unknown escape sequences (e.g., \x) are passed through as literal characters.
+static std::string process_escapes(const std::string& src)
+{
+    std::string result;
+    result.reserve(src.size());
+    for (size_t i = 0; i < src.size(); ++i) {
+        if (src[i] == '\\' && i + 1 < src.size()) {
+            switch (src[i + 1]) {
+                case 'n':  result.push_back('\n'); ++i; break;
+                case 'r':  result.push_back('\r'); ++i; break;
+                case 't':  result.push_back('\t'); ++i; break;
+                case '\\': result.push_back('\\'); ++i; break;
+                case '"':  result.push_back('"');  ++i; break;
+                case '\'': result.push_back('\''); ++i; break;
+                default:
+                    // Unknown escape — pass through both characters literally.
+                    result.push_back(src[i]);
+                    result.push_back(src[i + 1]);
+                    ++i; // consume the next character too
+                    break;
+            }
+        } else {
+            result.push_back(src[i]);
+        }
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Shared rule parsing and line-level substitution
 // ---------------------------------------------------------------------------
 
@@ -242,8 +283,54 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
 
     std::vector<GCodeSubRule> rules;
 
+    // Lambda: protect \{ and \} by replacing them with sentinel characters.
+    // This prevents escape processing from consuming the backslash before
+    // we can restore it for the regex engine.
+    auto protect_escaped_braces = [](const std::string& str) -> std::string {
+        std::string result;
+        result.reserve(str.size());
+        for (size_t i = 0; i < str.size(); ++i) {
+            if (str[i] == '\\' && i + 1 < str.size()) {
+                if (str[i + 1] == '{') {
+                    result.push_back(OPEN_BRACE_SENTINEL);
+                    ++i; // consume both \ and {
+                    continue;
+                }
+                if (str[i + 1] == '}') {
+                    result.push_back(CLOSE_BRACE_SENTINEL);
+                    ++i; // consume both \ and }
+                    continue;
+                }
+            }
+            result.push_back(str[i]);
+        }
+        return result;
+    };
+
+    // Lambda: restore sentinel characters back to braces.
+    // When keep_backslash is true (for regex find patterns), the backslash
+    // is preserved so the regex engine receives \{ / \} (literal brace).
+    // When keep_backslash is false (for replace strings), only the bare
+    // brace is emitted.
+    auto restore_escaped_braces = [](const std::string& str, bool keep_backslash) -> std::string {
+        std::string result;
+        result.reserve(str.size());
+        for (char c : str) {
+            if (c == OPEN_BRACE_SENTINEL) {
+                if (keep_backslash) result.push_back('\\');
+                result.push_back('{');
+            } else if (c == CLOSE_BRACE_SENTINEL) {
+                if (keep_backslash) result.push_back('\\');
+                result.push_back('}');
+            } else {
+                result.push_back(c);
+            }
+        }
+        return result;
+    };
+
     // Explicitly capture target_multiline to avoid scoping isolation
-    auto expand_rules = [&rules, target_multiline](const ConfigOptionStrings* subs) {
+    auto expand_rules = [&rules, target_multiline, &protect_escaped_braces, &restore_escaped_braces](const ConfigOptionStrings* subs) {
         for (const auto& raw_value : subs->values) {
             std::vector<std::string> lines;
             boost::split(lines, raw_value, boost::is_any_of("\r\n"), boost::token_compress_on);
@@ -286,27 +373,81 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
                     continue;
                 }
 
-                // Parse flags — regex-only flags are local (baked into compiled_regex at parse time).
-                bool has_m_flag        = flags.find('m') != std::string::npos;
+                // Parse block-type flags: L = layer block, C = color/toolhead block.
+                // Block-type rules require full-file chunked processing.
+                // The m flag is a regex flag that works within chunks normally.
+                GCodeSubBlockType block_type = GCodeSubBlockType::None;
+                bool has_L = flags.find('L') != std::string::npos;
+                bool has_C = flags.find('C') != std::string::npos;
+                if (has_L && has_C) {
+                    BOOST_LOG_TRIVIAL(warning) << "GCode substitution: both L and C flags set in rule. L takes precedence.";
+                }
+                if (has_L)
+                    block_type = GCodeSubBlockType::Line;
+                else if (has_C)
+                    block_type = GCodeSubBlockType::Color;
+                rule.block_type = block_type;
 
-                // Determine multiline requirement early — before regex compilation —
-                // so incompatible rules are skipped without the compilation cost.
-                rule.needs_multiline = has_m_flag ||
-                    rule.find.find('\n') != std::string::npos ||
-                    rule.find.find('\r') != std::string::npos ||
-                    rule.replace.find('\n') != std::string::npos ||
-                    rule.replace.find('\r') != std::string::npos;
-                // Drop rules that are not applicable for this call.
-                if (target_multiline && !rule.needs_multiline)
+                // Quick filter: drop rules that are clearly not applicable based on
+                // block-type flags alone, before doing expensive escape processing.
+                bool is_block_rule = block_type != GCodeSubBlockType::None;
+                if (target_multiline && !is_block_rule)
                     continue;
-                if (!target_multiline && rule.needs_multiline)
+                if (!target_multiline && is_block_rule)
                     continue;
-                
+
+                // --- Escape processing pipeline ---
+                // Order matters:
+                //  1. protect_escaped_braces — convert \{ / \} to sentinels (consumes both chars)
+                //  2. process_escapes — resolve \n, \r, \t, \\, \", \'
+                //  3. restore_escaped_braces — convert sentinels back to braces
+                //
+                // For regex find patterns: keep_backslash=true so regex engine receives \{ / \}
+                // For replace strings: keep_backslash=false so bare { / } is emitted
+
+                // Step 1: Protect escaped braces in both find and replace.
+                std::string protected_find    = protect_escaped_braces(rule.find);
+                std::string protected_replace = protect_escaped_braces(rule.replace);
+
+                // Step 2: Process escape sequences.
+                // For regex find patterns, escape sequences are NOT processed — the regex
+                // engine handles \d, \s, \n, etc. directly. For literal find patterns and
+                // all replace strings, escape sequences are processed.
+                std::string processed_find, processed_replace;
+                if (rule.is_regex) {
+                    // Regex find: do NOT process escapes (let regex engine handle them).
+                    // But we still need to restore the protected braces with keep_backslash=true.
+                    processed_find = protected_find;
+                } else {
+                    // Literal find: process escapes normally.
+                    processed_find = process_escapes(protected_find);
+                }
+                // Replace string: always process escapes.
+                processed_replace = process_escapes(protected_replace);
+
+                // Step 3: Restore escaped braces.
+                // Regex find: keep_backslash=true so \{ becomes \{ (regex literal brace).
+                // Literal find: keep_backslash=false so \{ becomes { (literal brace).
+                // Replace: keep_backslash=false so \{ becomes { (literal brace).
+                if (rule.is_regex) {
+                    rule.find    = restore_escaped_braces(processed_find, true);
+                } else {
+                    rule.find    = restore_escaped_braces(processed_find, false);
+                }
+                rule.replace = restore_escaped_braces(processed_replace, false);
+
+                if (rule.find.empty()) {
+                    BOOST_LOG_TRIVIAL(warning) << "GCode substitution skipped: empty find pattern after escape processing in: " << line;
+                    continue;
+                }
+
+
                 bool case_insensitive  = flags.find('i') != std::string::npos;
                 bool no_sub_match      = flags.find('n') != std::string::npos;
                 bool collate           = flags.find('c') != std::string::npos;
                 bool match_newline     = flags.find('s') != std::string::npos;
                 bool format_first_only = flags.find('f') != std::string::npos;
+                bool has_m_flag        = flags.find('m') != std::string::npos;
 
                 // case_insensitive is needed at runtime for literal substitution.
                 rule.case_insensitive  = case_insensitive;
@@ -329,7 +470,6 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
                 }
                 BOOST_LOG_TRIVIAL(debug) << "Parsed substitution rule: is_regex=" << rule.is_regex
                     << " case_insensitive=" << rule.case_insensitive
-                    << " needs_multiline=" << rule.needs_multiline
                     << " format_first_only=" << rule.format_first_only
                     << " find=" << rule.find;
                 rules.push_back(std::move(rule));
@@ -345,34 +485,55 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
     return rules;
 }
 
-// Apply a single substitution rule to a single gcode line (streaming, no full-file load).
-// Only rules without the 'm' (multiline) flag should be passed here.
-// Returns true if the line was modified.
-bool apply_gcode_substitution_line(GCodeSubRule &rule, std::string &line)
+// Helper: count newlines (\n and \r) in a string.
+static int count_newlines(const std::string& str)
 {
-    if (rule.needs_multiline)
-        return false; // multiline/newline rules require full-file context
+    int count = 0;
+    for (char c : str) {
+        if (c == '\n' || c == '\r')
+            ++count;
+    }
+    return count;
+}
 
+// Shared helper: apply a single substitution rule (regex or literal) to a string.
+// warn_newlines: when true, emit a warning if the replacement introduces newlines
+//                (used only in single-line streaming mode).
+// Returns true if the string was modified.
+static bool apply_substitution_rule(GCodeSubRule &rule, std::string &src, bool warn_newlines)
+{
     if (rule.is_regex) {
-        // Use pre-compiled regex from parse time.
         if (!rule.compiled_regex)
-            return false; // invalid regex, already warned at parse time
-
-        if (!boost::regex_search(line, *rule.compiled_regex))
             return false;
 
-        // Build format flags bitmask.
+        if (!boost::regex_search(src, *rule.compiled_regex))
+            return false;
+
         boost::match_flag_type format_flags = boost::regex_constants::format_default;
         if (rule.format_first_only) format_flags |= boost::regex_constants::format_first_only;
 
         std::string result;
-        result.reserve(line.size());
+        result.reserve(src.size());
         boost::regex_replace(
             std::back_inserter(result),
-            line.begin(), line.end(),
+            src.begin(), src.end(),
             *rule.compiled_regex, rule.replace, format_flags
         );
-        line = std::move(result);
+
+        if (warn_newlines) {
+            // In streaming mode, src is a single G-code line (no newlines), so
+            // newlines_in_src should be 0.  Just catches edge cases.
+            int newlines_in_replace = count_newlines(rule.replace);
+            int newlines_in_src     = count_newlines(src);
+            if (newlines_in_replace > newlines_in_src) {
+                throw Slic3r::RuntimeError(Slic3r::format(
+                    "GCode substitution failed: replacement introduces %1% newline(s) in single-line (streaming) mode. "
+                    "Line numbering would be corrupted. Use the L (layer block) or C (color block) flag for multiline replacements.",
+                    newlines_in_replace - newlines_in_src));
+            }
+        }
+
+        src = std::move(result);
         return true;
     }
 
@@ -380,18 +541,18 @@ bool apply_gcode_substitution_line(GCodeSubRule &rule, std::string &line)
     size_t pos = 0;
     bool literal_match_found = false;
     std::string result;
-    
+
     while (true) {
         size_t found_pos = std::string::npos;
 
         if (rule.case_insensitive) {
             auto it = boost::ifind_first(
-                boost::make_iterator_range(line.begin() + pos, line.end()), rule.find);
+                boost::make_iterator_range(src.begin() + pos, src.end()), rule.find);
             if (it) {
-                found_pos = static_cast<size_t>(std::distance(line.begin(), it.begin()));
+                found_pos = static_cast<size_t>(std::distance(src.begin(), it.begin()));
             }
         } else {
-            found_pos = line.find(rule.find, pos);
+            found_pos = src.find(rule.find, pos);
         }
 
         if (found_pos == std::string::npos)
@@ -399,177 +560,319 @@ bool apply_gcode_substitution_line(GCodeSubRule &rule, std::string &line)
 
         if (!literal_match_found) {
             literal_match_found = true;
-            // Allocate result buffer only when a match is confirmed.
-            result.reserve(line.size() + rule.replace.size());
-            result.append(line, 0, found_pos);
+            result.reserve(src.size() + rule.replace.size());
+            result.append(src, 0, found_pos);
             result.append(rule.replace);
             pos = found_pos + rule.find.length();
 
             if (rule.format_first_only) {
-                result.append(line, pos, std::string::npos);
-                line = std::move(result);
+                result.append(src, pos, std::string::npos);
+
+                if (warn_newlines) {
+                    int newlines_in_replace = count_newlines(rule.replace);
+                    int newlines_in_src     = count_newlines(src);
+                    if (newlines_in_replace > newlines_in_src) {
+                        throw Slic3r::RuntimeError(Slic3r::format(
+                            "GCode substitution failed: replacement introduces %1% newline(s) in single-line (streaming) mode. "
+                            "Line numbering would be corrupted. Use the L (layer block) or C (color block) flag for multiline replacements.",
+                            newlines_in_replace - newlines_in_src));
+                    }
+                }
+
+                src = std::move(result);
                 return true;
             }
             continue;
         }
 
-        // Subsequent matches — append to already-allocated result.
-        result.append(line, pos, found_pos - pos);
+        result.append(src, pos, found_pos - pos);
         result.append(rule.replace);
         pos = found_pos + rule.find.length();
     }
 
     if (!literal_match_found)
-        return false; // no match found
+        return false;
 
-    result.append(line, pos, std::string::npos);
-    line = std::move(result);
+    if (warn_newlines) {
+        // Only error if the replacement introduces newlines that weren't already
+        // in the source. If the source already contains newlines (shouldn't happen
+        // in streaming mode, but guard against it), we still warn rather than fail.
+        int newlines_in_replace = count_newlines(rule.replace);
+        int newlines_in_src     = count_newlines(src);
+        if (newlines_in_replace > newlines_in_src) {
+            throw Slic3r::RuntimeError(Slic3r::format(
+                "GCode substitution failed: replacement introduces %1% newline(s) in single-line (streaming) mode. "
+                "Line numbering would be corrupted. Use the L (layer block) or C (color block) flag for multiline replacements.",
+                newlines_in_replace - newlines_in_src));
+        }
+    }
+
+    result.append(src, pos, std::string::npos);
+    src = std::move(result);
     return true;
 }
 
+// Apply a single substitution rule to a single gcode line (streaming, no full-file load).
+// Only line-level rules (without L/C block flags) should be passed here.
+// Returns true if the line was modified.
+bool apply_gcode_substitution_line(GCodeSubRule &rule, std::string &line)
+{
+    // Assertion: block-type rules should not reach the streaming path.
+    assert(rule.block_type == GCodeSubBlockType::None &&
+           "Block-type rule (L/C) should not be processed in streaming mode");
+    return apply_substitution_rule(rule, line, true);
+}
+
 // ---------------------------------------------------------------------------
-// Full-file (multiline) substitution — only for rules with 'm' flag
+// Full-file (multiline) substitution — chunked by layer/color boundaries
 // ---------------------------------------------------------------------------
 
-// Apply sed-like regex/literal substitutions to the G-code file in-place.
-// Uses a ping-pong dual-buffer to avoid per-rule full-string allocations.
+// Fast string prefix checks for layer/color marker detection.
+// Avoids regex overhead on every line of a multi-million-line G-code file.
+
+// Check if a line starts with a layer change marker.
+// Accepts "; CHANGE_LAYER", ";CHANGE_LAYER", "; LAYER_CHANGE", ";LAYER_CHANGE".
+static bool is_layer_marker(const std::string& line)
+{
+    if (line.size() < 14 || line[0] != ';')
+        return false;
+
+    // Skip the semicolon and any optional spaces
+    size_t pos = 1;
+    while (pos < line.size() && line[pos] == ' ')
+        ++pos;
+
+    std::string_view sv(line.data() + pos, line.size() - pos);
+    return sv.starts_with("LAYER_CHANGE") || sv.starts_with("CHANGE_LAYER");
+}
+
+// Check if a line starts with a color change marker.
+// Accepts "; CP TOOLCHANGE START", ";CP TOOLCHANGE START".
+static bool is_color_marker(const std::string& line)
+{
+    if (line.size() < 21 || line[0] != ';')
+        return false;
+
+    // Skip the semicolon and any optional spaces
+    size_t pos = 1;
+    while (pos < line.size() && line[pos] == ' ')
+        ++pos;
+
+    std::string_view sv(line.data() + pos, line.size() - pos);
+    return sv.starts_with("CP TOOLCHANGE START");
+}
+
+// Apply a single substitution rule to a string (either regex or literal).
+// Returns true if the string was modified.
+// This is the chunked (block-level) variant — no newline warnings.
+static bool apply_rule_to_string(GCodeSubRule &rule, std::string &src)
+{
+    return apply_substitution_rule(rule, src, /* warn_newlines = */ false);
+}
+
+// Apply rules to a string buffer. Updates modified flag if any rule matched.
+static void apply_rules_to_string(
+    std::string &buf,
+    const std::vector<GCodeSubRule*> &rules,
+    bool &modified)
+{
+    if (buf.empty() || rules.empty())
+        return;
+    for (auto *rule : rules) {
+        if (apply_rule_to_string(*rule, buf))
+            modified = true;
+    }
+}
+
+// Flush a color chunk: apply color rules, then append to destination.
+// Clears color_chunk on return. If color_rules is empty, the chunk passes
+// through unchanged (no substitution applied).
+static void flush_color_chunk(
+    std::string &color_chunk,
+    const std::vector<GCodeSubRule*> &color_rules,
+    std::string &dest,
+    bool &modified)
+{
+    if (color_chunk.empty())
+        return;
+
+    apply_rules_to_string(color_chunk, color_rules, modified);
+    dest.append(color_chunk);
+    color_chunk.clear();
+}
+
+// Flush a layer chunk: apply layer rules, then write directly to output file.
+// Clears layer_content on return.
+static void flush_layer_chunk(
+    std::string &layer_content,
+    const std::vector<GCodeSubRule*> &layer_rules,
+    FILE *out,
+    bool &modified)
+{
+    if (layer_content.empty())
+        return;
+
+    apply_rules_to_string(layer_content, layer_rules, modified);
+    size_t cnt_written = ::fwrite(layer_content.data(), 1, layer_content.size(), out);
+    if (::ferror(out) || cnt_written != layer_content.size())
+        throw Slic3r::RuntimeError(Slic3r::format("GCode substitution failed. Error writing file."));
+    layer_content.clear();
+}
+
+// Apply sed-like regex/literal substitutions streaming from in_path to out_path.
+// Uses streaming chunking: the file is read line-by-line and split at
+// layer/color boundaries. Rules are applied per-chunk based on their
+// block_type. Processed chunks are written directly to out_path — no
+// full-file accumulation in memory.
+//
+// G-code structure:
+//   preamble (before first layer marker)
+//   layer 1
+//     color chunk 1
+//     color chunk 2
+//   layer 2
+//     color chunk 1
+//   suffix (after last layer, separate section)
+//
+// Rule application:
+//   - Color rules (C flag): applied per color chunk (within layers only)
+//   - Layer rules (L flag): applied per layer, preamble, and suffix
+//   - Preamble: layer rules only (color rules require color chunks, which only exist within layers)
+//   - Suffix: layer rules only (same reason as preamble)
+//
+// Known limitation: Color chunks are split at layer boundaries. If a single
+// color/toolhead spans multiple layers, color rules (C flag) are applied
+// independently to each layer's portion of that color. A color rule matching
+// content that crosses a layer boundary will not match. This is intentional:
+// keeping chunks separated by layer allows layer rules (L flag) to operate
+// on per-layer content, and future macro/variable support will need layer
+// context to resolve height-dependent variables.
+//
+// Known limitation: The m (multiline) flag in regex rules changes ^ and $ to
+// match at line boundaries within the chunk. When used with block rules (L/C),
+// this means ^ and $ match at each line boundary within the layer/color chunk,
+// not just at the chunk boundaries.
+//
 // Must be called before run_post_process_scripts() so external scripts
 // see the substituted content.
-// Returns true if substitutions were defined and processed.
+// Returns true if substitutions were applied.
 // Returns false if no gcode_substitutions were defined.
 // Throws an exception on error.
-bool apply_gcode_substitutions(std::string &src_path, std::vector<GCodeSubRule> &&all_rules)
+bool apply_gcode_substitutions(const std::string &in_path, const std::string &out_path, std::vector<GCodeSubRule> &&all_rules)
 {
     if (all_rules.empty())
         return false;
 
     try {
-        // Read the entire G-code file into primary memory buffer.
-        std::string gcode;
-        {
-            FilePtr in{ boost::nowide::fopen(src_path.c_str(), "rb") };
-            if (in.f == nullptr)
-                throw Slic3r::RuntimeError(Slic3r::format("GCode substitution failed. Cannot open file for reading: %1%", src_path));
+        // Categorize rules by block type. All rules reaching this function are
+        // block-type rules (L/C flags). Per-line rules are handled by
+        // apply_gcode_substitution_line in the streaming loop.
+        // Cross layer regex is not supported.
+        std::vector<GCodeSubRule*> layer_rules;  // L flag — apply per layer chunk
+        std::vector<GCodeSubRule*> color_rules;  // C flag — apply per color chunk
 
-            std::error_code ec;
-            auto size = boost::filesystem::file_size(src_path, ec);
-            if (ec)
-                throw Slic3r::RuntimeError(Slic3r::format("GCode substitution failed. Cannot determine file size: %1%", src_path));
-
-            gcode.resize(size);
-            size_t cnt_read = ::fread(gcode.data(), 1, size, in.f);
-            if (::ferror(in.f))
-                throw Slic3r::RuntimeError(Slic3r::format("GCode substitution failed. Error reading file: %1%", src_path));
-            gcode.resize(cnt_read);
+        for (auto &rule : all_rules) {
+            // Assertion: only block-type rules should reach this path.
+            assert(rule.block_type != GCodeSubBlockType::None &&
+                   "Non-block rule (line-level) should not be processed in block-mode");
+            if (rule.block_type == GCodeSubBlockType::Line)
+                layer_rules.push_back(&rule);
+            else if (rule.block_type == GCodeSubBlockType::Color)
+                color_rules.push_back(&rule);
         }
 
-        // Allocate exactly one secondary scratch buffer for ping-pong swapping.
-        std::string alt_gcode;
+        if (layer_rules.empty() && color_rules.empty())
+            return false;
+
         bool modified = false;
 
-        // Pointers track which buffer holds the current "source" data.
-        std::string* current_source = &gcode;
-        std::string* current_target = &alt_gcode;
+        // --- Streaming chunked processing (L/C rules) ---
+        // Hierarchical: layer → color. Read line by line, accumulate color chunks,
+        // process color rules and append to layer_content, process layer rules
+        // and write directly to output file.
+        {
+            FilePtr in{ boost::nowide::fopen(in_path.c_str(), "rb") };
+            if (in.f == nullptr)
+                throw Slic3r::RuntimeError(Slic3r::format("GCode substitution failed. Cannot open file for reading: %1%", in_path));
 
-        // Process each multiline substitution rule using the pre-parsed GCodeSubRule.
-        for (auto &rule : all_rules) {
-            if (rule.is_regex) {
-                // Use pre-compiled regex from parse time.
-                if (!rule.compiled_regex)
-                    continue; // invalid regex, already warned at parse time
+            FilePtr out{ boost::nowide::fopen(out_path.c_str(), "wb") };
+            if (out.f == nullptr)
+                throw Slic3r::RuntimeError(Slic3r::format("GCode substitution failed. Cannot open file for writing: %1%", out_path));
 
-                // Check first — zero copy penalty if no match.
-                if (!boost::regex_search(*current_source, *rule.compiled_regex))
-                    continue;
+            std::string color_chunk;    // accumulates lines for current color
+            std::string layer_content;  // accumulates processed color chunks (also used for preamble/suffix)
+            bool in_layer = false;
 
-                // Build format flags bitmask
-                boost::match_flag_type format_flags = boost::regex_constants::format_default;
-                if (rule.format_first_only) format_flags |= boost::regex_constants::format_first_only;
+            std::string line;
+            int layer_count = 0;
+            int color_count = 0;
+            while (std::getline(std::istream(in.f), line)) {
+                // Strip trailing \r from \r\n line endings (file is opened in binary mode).
+                if (!line.empty() && line.back() == '\r')
+                    line.pop_back();
 
-                modified = true;
-
-                // Clear and reserve the target buffer to avoid reallocation.
-                current_target->clear();
-                current_target->reserve(current_source->size());
-
-                // Stream replacement directly into target via back_inserter — no intermediate string.
-                boost::regex_replace(
-                    std::back_inserter(*current_target),
-                    current_source->begin(), current_source->end(),
-                    *rule.compiled_regex, rule.replace, format_flags
-                );
-
-                // Zero-allocation buffer swap: target becomes source for next rule.
-                std::swap(current_source, current_target);
-            } else {
-                // Literal substitution — support i (case-insensitive) and f (first only) flags.
-                size_t pos = 0;
-                bool literal_match_found = false;
-
-                while (true) {
-                    size_t found_pos = std::string::npos;
-
-                    if (rule.case_insensitive) {
-                        auto it = boost::ifind_first(
-                            boost::make_iterator_range(current_source->begin() + pos, current_source->end()), rule.find);
-                        if (it) {
-                            found_pos = static_cast<size_t>(std::distance(current_source->begin(), it.begin()));
-                        }
+                // ;LAYER_CHANGE
+                if (is_layer_marker(line)) {
+                    if (!in_layer) {
+                        BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing preamble (" << layer_content.size() << " bytes)";
                     } else {
-                        found_pos = current_source->find(rule.find, pos);
+                        // Subsequent layer — flush previous layer's color chunk first.
+                        BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing layer " << layer_count
+                            << " (layer_content=" << layer_content.size() << " bytes)";
+                        flush_color_chunk(color_chunk, color_rules, layer_content, modified);
                     }
-
-                    if (found_pos == std::string::npos)
-                        break;
-
-                    if (!literal_match_found) {
-                        literal_match_found = true;
-                        modified = true;
-                        current_target->clear();
-                        current_target->reserve(current_source->size());
-                    }
-
-                    // Push unchanged chunk preceding the match, then the replacement.
-                    current_target->append(*current_source, pos, found_pos - pos);
-                    current_target->append(rule.replace);
-
-                    pos = found_pos + rule.find.length();
-
-                    if (rule.format_first_only)
-                        break;
-                }
-
-                if (literal_match_found) {
-                    // Append remaining file contents after the final match.
-                    current_target->append(*current_source, pos, std::string::npos);
-                    std::swap(current_source, current_target);
+                    // Flush layer content (preamble on first marker, layer on subsequent).
+                    flush_layer_chunk(layer_content, layer_rules, out.f, modified);
+                    // Start new layer with this layer marker.
+                    color_chunk.append(line).push_back('\n');
+                    in_layer = true;
+                    ++layer_count;
+                    color_count = 0;
+                // ; CP TOOLCHANGE START
+                } else if (is_color_marker(line)) {
+                    // Flush previous color chunk within current layer.
+                    BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing color chunk " << color_count
+                        << " (color_chunk=" << color_chunk.size() << " bytes)";
+                    flush_color_chunk(color_chunk, color_rules, layer_content, modified);
+                    // Start new color chunk with this color marker.
+                    color_chunk.append(line).push_back('\n');
+                    ++color_count;
+                } else {
+                    // Regular line — append to current section.
+                    if (in_layer)
+                        color_chunk.append(line).push_back('\n');
+                    else
+                        layer_content.append(line).push_back('\n');
                 }
             }
+
+            // Flush remaining content.
+            BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing final color chunk ("
+                << color_chunk.size() << " bytes), final layer_content ("
+                << layer_content.size() << " bytes)";
+            flush_color_chunk(color_chunk, color_rules, layer_content, modified);
+            flush_layer_chunk(layer_content, layer_rules, out.f, modified);
+
+            BOOST_LOG_TRIVIAL(debug) << "GCode substitution: processed " << layer_count
+                << " layers";
         }
 
-        // Only write back to disk if content actually changed — avoids unnecessary I/O and timestamp changes.
-        if (modified) {
-            FilePtr out{ boost::nowide::fopen(src_path.c_str(), "wb") };
-            if (out.f == nullptr)
-                throw Slic3r::RuntimeError(Slic3r::format("GCode substitution failed. Cannot open file for writing: %1%", src_path));
-
-            // current_source points to whichever buffer holds the final data.
-            size_t cnt_written = ::fwrite(current_source->data(), 1, current_source->size(), out.f);
-            if (::ferror(out.f) || cnt_written != current_source->size())
-                throw Slic3r::RuntimeError(Slic3r::format("GCode substitution failed. Error writing file: %1%", src_path));
-        }
+        return modified;
     } catch (const std::exception &err) {
         BOOST_LOG_TRIVIAL(error) << "Exception caught during GCode substitution: " << err.what();
         throw;
     }
-
-    return true;
 }
 
 // Combined post-processor: applies substitutions then runs scripts.
-// Line-level substitution rules (without 'm' flag) are already applied during
-// the streaming GCodeProcessor::run_post_process() loop. Only multiline rules
-// (with 'm' flag) require the full-file apply_gcode_substitutions() pass here.
+// Line-level substitution rules (without L/C flags) are already applied during
+// the streaming GCodeProcessor::run_post_process() loop. Only block-mode rules
+// (L/C flags) require the full-file apply_gcode_substitutions() pass here.
+//
+// I/O optimization: when multiline rules exist, apply_gcode_substitutions reads
+// from the original file and writes directly to the output — no intermediate
+// copy_file call. This halves disk I/O and eliminates memory accumulation.
+//
 // If make_copy and either feature is active, creates a .pp copy to protect
 // the memory-mapped previewer handle. Returns true if any post-processing
 // work was done (caller must delete the .pp temp file when make_copy=true).
@@ -589,39 +892,53 @@ bool run_post_process(std::string &src_path, bool make_copy, const std::string &
         << " multiline_rules_count=" << multiline_rules.size()
         << " has_scripts=" << has_scripts;
 
-    if (make_copy && (!multiline_rules.empty() || has_scripts)) {
-        // Create an isolated temporary file to protect the active memory-mapped previewer handle.
-        std::string path = src_path + ".pp";
-        try {
-            if (boost::filesystem::exists(path))
-                boost::filesystem::remove(path);
-        } catch (const std::exception &err) {
-            BOOST_LOG_TRIVIAL(error) << Slic3r::format("Failed deleting an old temporary file %1% before substitutions/post-processing: %2%", path, err.what());
-        }
-
-        std::string error_message;
-        if (copy_file(src_path, path, error_message, false) != SUCCESS)
-            throw Slic3r::RuntimeError(Slic3r::format("Failed making a temporary copy of G-code file %1% before substitutions/post-processing: %2%", src_path, error_message));
-
-        src_path = std::move(path);
-    }
+    // Determine output path: .pp for isolated copy (make_copy), original for in-place.
+    std::string tmp_path = make_copy || !multiline_rules.empty() ? (src_path + ".pp") : src_path;
 
     try {
-        // 1. Apply multiline substitutions (line-level already done in streaming loop).
-        //    apply_gcode_substitutions returns false if no multiline rules.
-        apply_gcode_substitutions(src_path, std::move(multiline_rules));
+        // Remove stale temp file if it exists.
+        try {
+            if (boost::filesystem::exists(tmp_path))
+                boost::filesystem::remove(tmp_path);
+        } catch (const std::exception &err) {
+            BOOST_LOG_TRIVIAL(error) << Slic3r::format("Failed deleting an old temporary file %1%: %2%", tmp_path, err.what());
+        }
 
-        // 2. Run post-processing scripts (make_copy = false since we already handled isolation)
-        if (has_scripts)
-            run_post_process_scripts(src_path, false, host, output_name, config);
-    } catch (...) {
-        // Clean up the .pp temp file on error to prevent dangling files
+        // --- Step 1: Apply multiline substitutions ---
+        if (!multiline_rules.empty()) {
+            // Read from original, write directly to tmp_path — no intermediate copy.
+            apply_gcode_substitutions(src_path, tmp_path, std::move(multiline_rules));
+        }
+        // --- Step 2: If no rules but isolation needed, make a plain copy ---
+        else if (make_copy) {
+            std::string error_message;
+            if (copy_file(src_path, tmp_path, error_message, false) != SUCCESS)
+                throw Slic3r::RuntimeError(Slic3r::format("Failed making a temporary copy of G-code file %1%: %2%", src_path, error_message));
+        }
+        // else: no rules and no isolation — nothing to do for step 1/2.
+
+        // --- Step 3: Run post-processing scripts ---
+        if (has_scripts) {
+            run_post_process_scripts(tmp_path, host, output_name, config);
+        }
+
+        // --- Step 4: Finalize ---
         if (make_copy) {
+            // In-place: move the src path
+            src_path = std::move(tmp_path);
+        }
+        else if (!multiline_rules.empty()) {
+            // In-place: rename .tmp over original.
+            boost::filesystem::rename(tmp_path, src_path);
+        }
+    } catch (...) {
+        // Clean up temp file on error.
+        if (!multiline_rules.empty()||make_copy) {
             try {
-                if (boost::filesystem::exists(src_path))
-                    boost::filesystem::remove(src_path);
+                if (boost::filesystem::exists(tmp_path))
+                    boost::filesystem::remove(tmp_path);
             } catch (const std::exception &err) {
-                BOOST_LOG_TRIVIAL(error) << Slic3r::format("Failed deleting temporary G-code file %1% on error: %2%", src_path, err.what());
+                BOOST_LOG_TRIVIAL(error) << Slic3r::format("Failed deleting temporary G-code file %1% on error: %2%", tmp_path, err.what());
             }
         }
         throw;
@@ -636,52 +953,19 @@ bool run_post_process(std::string &src_path, bool make_copy, const std::string &
 // Returns false if no post-processing script was defined.
 // Throws an exception on error.
 // host is one of "File", "PrusaLink", "Repetier", "SL1Host", "OctoPrint", "FlashAir", "Duet", "AstroBox" ...
-// For a "File" target, a temp file will be created for src_path by adding a ".pp" suffix and src_path will be updated.
-// In that case the caller is responsible to delete the temp file created.
 // output_name is the final name of the G-code on SD card or when uploaded to PrusaLink or OctoPrint.
 // If uploading to PrusaLink or OctoPrint, then the file will be renamed to output_name first on the target host.
 // The post-processing script may change the output_name.
-bool run_post_process_scripts(std::string &src_path, bool make_copy, const std::string &host, std::string &output_name, const DynamicPrintConfig &config)
+bool run_post_process_scripts(std::string &src_path, const std::string &host, std::string &output_name, const DynamicPrintConfig &config)
 {
     const auto *post_process = config.opt<ConfigOptionStrings>("post_process");
     if (// likely running in SLA mode
-        post_process == nullptr || 
+        post_process == nullptr ||
         // no post-processing script
         post_process->values.empty())
         return false;
 
-    std::string path;
-    if (make_copy) {
-        // Don't run the post-processing script on the input file, it will be memory mapped by the G-code viewer.
-        // Make a copy.
-        path = src_path + ".pp";
-        // First delete an old file if it exists.
-        try {
-            if (boost::filesystem::exists(path))
-                boost::filesystem::remove(path);
-        } catch (const std::exception &err) {
-            BOOST_LOG_TRIVIAL(error) << Slic3r::format("Failed deleting an old temporary file %1% before running a post-processing script: %2%", path, err.what());
-        }
-        // Second make a copy.
-        std::string error_message;
-        if (copy_file(src_path, path, error_message, false) != SUCCESS)
-            throw Slic3r::RuntimeError(Slic3r::format("Failed making a temporary copy of G-code file %1% before running a post-processing script: %2%", src_path, error_message));
-    } else {
-        // Don't make a copy of the G-code before running the post-processing script.
-        path = src_path;
-    }
-
-    auto delete_copy = [&path, &src_path, make_copy]() {
-        if (make_copy)
-            try {
-                if (boost::filesystem::exists(path))
-                    boost::filesystem::remove(path);
-            } catch (const std::exception &err) {
-                BOOST_LOG_TRIVIAL(error) << Slic3r::format("Failed deleting a temporary copy %1% of a G-code file %2% : %3%", path, src_path, err.what());
-            }
-    };
-
-    auto gcode_file = boost::filesystem::path(path);
+    auto gcode_file = boost::filesystem::path(src_path);
     if (! boost::filesystem::exists(gcode_file))
         throw Slic3r::RuntimeError(std::string("Post-processor can't find exported gcode file"));
 
@@ -694,7 +978,7 @@ bool run_post_process_scripts(std::string &src_path, bool make_copy, const std::
     boost::nowide::setenv("SLIC3R_PP_OUTPUT_NAME", output_name.c_str(), 1);
 
     // Path to an optional file that the post-processing script may create and populate it with a single line containing the output_name replacement.
-    std::string path_output_name = path + ".output_name";
+    std::string path_output_name = src_path + ".output_name";
     auto remove_output_name_file = [&path_output_name, &src_path]() {
         try {
             if (boost::filesystem::exists(path_output_name))
@@ -715,14 +999,13 @@ bool run_post_process_scripts(std::string &src_path, bool make_copy, const std::
                 boost::trim(script);
                 if (script.empty())
                     continue;
-                BOOST_LOG_TRIVIAL(info) << "Executing script " << script << " on file " << path;
+                BOOST_LOG_TRIVIAL(info) << "Executing script " << script << " on file " << src_path;
                 std::string std_err;
                 const int result = run_script(script, gcode_file.string(), std_err);
                 if (result != 0) {
-                    const std::string msg = std_err.empty() ? (boost::format("Post-processing script %1% on file %2% failed.\nError code: %3%") % script % path % result).str()
-                        : (boost::format("Post-processing script %1% on file %2% failed.\nError code: %3%\nOutput:\n%4%") % script % path % result % std_err).str();
+                    const std::string msg = std_err.empty() ? (boost::format("Post-processing script %1% on file %2% failed.\nError code: %3%") % script % src_path % result).str()
+                        : (boost::format("Post-processing script %1% on file %2% failed.\nError code: %3%\nOutput:\n%4%") % script % src_path % result % std_err).str();
                     BOOST_LOG_TRIVIAL(error) << msg;
-                    delete_copy();
                     throw Slic3r::RuntimeError(msg);
                 }
                 if (! boost::filesystem::exists(gcode_file)) {
@@ -730,7 +1013,7 @@ bool run_post_process_scripts(std::string &src_path, bool make_copy, const std::
                         "Post-processing script %1% failed.\n\n"
                         "The post-processing script is expected to change the G-code file %2% in place, but the G-code file was deleted and likely saved under a new name.\n"
                         "Please adjust the post-processing script to change the G-code in place and consult the manual on how to optionally rename the post-processed G-code file.\n")))
-                        % script % path).str();
+                        % script % src_path).str();
                     BOOST_LOG_TRIVIAL(error) << msg;
                     throw Slic3r::RuntimeError(msg);
                 }
@@ -774,11 +1057,9 @@ bool run_post_process_scripts(std::string &src_path, bool make_copy, const std::
         }
     } catch (...) {
         remove_output_name_file();
-        delete_copy();
         throw;
     }
 
-    src_path = std::move(path);
     return true;
 }
 

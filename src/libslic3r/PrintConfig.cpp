@@ -931,6 +931,98 @@ void PrintConfigDef::init_common_params()
     }
 }
 
+// Shared documentation for gcode_substitutions and printer_gcode_substitutions tooltips.
+// Each tooltip prepends its own intro text before this common block.
+static constexpr const char* gcode_substitutions_common_doc =
+"═══════════════════════════════════════════════════════════\n"
+"FORMAT\n"
+"═══════════════════════════════════════════════════════════\n"
+"Each line: s/find/replace/flags  (regex) or  l/find/replace/flags  (literal)\n\n"
+"Delimiter can be any character after s or l. Choose a delimiter that does not appear\n"
+"in the pattern or replacement string. There is no escape mechanism for the delimiter.\n"
+"  e.g.: s@G1@G0@i  or  s#OLD#NEW#  or  s|find|replace|i\n\n"
+"Comments: anything after the 4th delimiter is ignored (useful for inline documentation).\n"
+"  e.g.: s/G1/G0/i/ ; replace G1 with G0\n\n"
+"═══════════════════════════════════════════════════════════\n"
+"SYNTAX FLAGS\n"
+"═══════════════════════════════════════════════════════════\n"
+"  i  = case-insensitive\n"
+"  n  = no-sub-match (disables capture group tracking, improves performance when\n"
+"       you don't need ${1} etc. in the replacement)\n"
+"  c  = collate (uses the current locale for character comparison)\n"
+"  m  = multiline (^ and $ match at line boundaries within the chunk, not just\n"
+"       at the start/end of the entire chunk)\n\n"
+"INLINE MODIFIER\n"
+"═══════════════════════════════════════════════════════════\n"
+"  s  = match-newline (adds (?s) to regex, making . match newline characters)\n\n"
+"FORMAT FLAGS\n"
+"═══════════════════════════════════════════════════════════\n"
+"  f  = format-first-only (replace only the first match, then stop)\n"
+"    In streaming (per-line) mode, 'f' replaces the first match on each line.\n"
+"    In full-file block mode (L/C flags), 'f' replaces only the first match\n"
+"    within each chunk (layer or color block), which means the same substitution\n"
+"    can fire once per chunk — effectively duplicating the action across chunks.\n\n"
+"BLOCK FLAGS (require full-file processing — not available in streaming mode)\n"
+"═══════════════════════════════════════════════════════════\n"
+"  L  = layer block — substitution is applied per layer chunk. The G-code is split\n"
+"       at ; CHANGE_LAYER / ;LAYER_CHANGE markers. Each layer's content is\n"
+"       processed independently. Preamble (before first layer) and suffix\n"
+"       (after last layer) are also treated as layer chunks.\n\n"
+"  C  = color/toolhead block — substitution is applied per color chunk within\n"
+"       each layer. Color chunks are delimited by ; CP TOOLCHANGE START.\n"
+"       Color rules only apply within layers (not to preamble or suffix).\n\n"
+"    If both L and C are set on the same rule, L takes precedence. Color chunks are split at layer boundaries, so a color\n"
+"    rule cannot match content that crosses a layer boundary.\n\n"
+"═══════════════════════════════════════════════════════════\n"
+"ESCAPE SEQUENCES\n"
+"═══════════════════════════════════════════════════════════\n"
+"Processed in literal find strings and ALL replace strings:\n"
+"  \\n = newline, \\r = carriage return, \\t = tab, \\\\ = backslash\n"
+"  \\\" = double quote, \\' = single quote\n"
+"  \\{ = literal open brace, \\} = literal close brace\n\n"
+"⚠ Regex find strings do NOT process escape sequences — the regex engine\n"
+"  handles \\d, \\s, \\n, etc. directly. Use \\{ and \\} for literal braces\n"
+"  in regex patterns (these are preserved and passed to the regex engine).\n\n"
+"═══════════════════════════════════════════════════════════\n"
+"PROCESSING MODES (important quirk)\n"
+"═══════════════════════════════════════════════════════════\n"
+"  Streaming (per-line): Most rules are applied line-by-line during G-code\n"
+"  generation. This is fast and memory-efficient. However, streaming rules\n"
+"  CANNOT insert newlines — each input line produces one output line.\n\n"
+"  Full-file: Rules with the 'm' flag, L/C block flags, or containing \\n/\\r\n"
+"  in find/replace strings are processed in a separate full-file pass after\n"
+"  the G-code file is written. This allows multiline matches and newline\n"
+"  insertion.\n\n"
+"  ⚠ If a streaming rule's replacement contains newlines, the slicing process\n"
+"    will abort to prevent corrupted time and temperature calculations.\n"
+"    Use the L or C flags if your substitution introduces newlines.\n\n"
+"═══════════════════════════════════════════════════════════\n"
+"CAPTURE GROUPS\n"
+"═══════════════════════════════════════════════════════════\n"
+"Use ${1}, ${2}, ${3}, etc. in the replacement string to reference\n"
+"capture groups from the regex find pattern. Use the 'n' flag if you\n"
+"don't need capture groups (improves performance).\n\n"
+"═══════════════════════════════════════════════════════════\n"
+"ERRORS AND WARNINGS\n"
+"═══════════════════════════════════════════════════════════\n"
+"  - Empty find patterns are skipped with a warning logged.\n"
+"  - Invalid regex patterns throw an error and abort slicing.\n"
+"  - Lines not starting with 's' or 'l' are silently ignored.\n\n"
+"═══════════════════════════════════════════════════════════\n"
+"EXAMPLES\n"
+"═══════════════════════════════════════════════════════════\n"
+"  s/G1 F/G0 F/i/                    Replace G1 with G0, case-insensitive\n"
+"  l/M104/M109//                     Literal replace M104 with M109\n"
+"  s/M109 S[0-9]+/M109 S200/f/       Replace first M109 temp set to 200\n"
+"  s@G1 E-@G1 E@i@                   Replace retract moves\n"
+"  s@(;TYPE:Top solid infill)@${1}M221 S98@s@  Append M221 S98 after top infill type comment\n"
+"  s@M221 S95@M221 S100@f@           Replace first occurrence of 95% flow with 100%\n"
+"  s@; filament_colour_type = ([0-9]+);([0-9]+);([0-9]+);([0-9]+)@; filament_color_type: [\"${1}\", \"${2}\", \"${3}\", \"${4}\"]@@  Convert filament colour format\n"
+"  l/foo\\nbar/baz/                  Literal match foo<newline>bar, replace with baz (full-file mode)\n"
+"  s/foo\\{/bar/                     Regex match literal foo{, replace with bar\n"
+"  s/OLD/NEW/iL/                     Replace OLD with NEW per layer chunk\n"
+"  s/OLD/NEW/iC/                     Replace OLD with NEW per color/toolhead chunk";
+
 void PrintConfigDef::init_fff_params()
 {
     ConfigOptionDef* def;
@@ -2036,26 +2128,8 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("gcode_substitutions", coStrings);
     def->label = L("G-code Substitutions");
-    def->tooltip = L("Sed-like regex/literal substitutions applied to G-code before post-processing scripts.\n\n"
-                     "Each line: s/find/replace/flags  (regex) or  l/find/replace/flags  (literal)\n\n"
-                     "Delimiter can be any character after s or l. Choose a delimiter that does not appear\n"
-                     "in the pattern or replacement string. There is no escape mechanism for the delimiter.\n"
-                     "  e.g.: s@G1@G0@i  or  s#OLD#NEW#  or  s|find|replace|i\n\n"
-                     "Syntax Flags: i = case-insensitive, n = no-sub-match, c = collate, m = multiline\n"
-                     "Inline Modifier: s = match-newline (?s)\n"
-                     "Format Flags: f = format-first-only (replace first match only)\n\n"
-                     "Capture groups use ${1}, ${2}, ${3}, etc in the replacement string.\n\n"
-                     "Comments: anything after the 4th delimiter is ignored (useful for inline documentation).\n\n"
-                     "Note: Rules with the 'm' flag or containing \\n/\\r in find/replace are processed\n"
-                     "in a separate full-file pass. All other rules are applied per-line during streaming and cannot add newlines.\n\n"
-                     "Examples:\n"
-                     "  s/G1 F/G0 F/i/                    Replace G1 with G0, case-insensitive\n"
-                     "  l/M104/M109//                     Literal replace M104 with M109\n"
-                     "  s/M109 S[0-9]+/M109 S200/f/       Replace first M109 temp set to 200\n"
-                     "  s@G1 E-@G1 E@i@                   Replace retract moves\n"
-                     "  s@(;TYPE:Top solid infill)@${1}M221 S98@s@  Increase top infill flow to 98%\n"
-                     "  s@M221 S95@M221 S100@f@           Replace first occurrence of 95% flow with 100%\n"
-                     "  s@; filament_colour_type = ([0-9]+);([0-9]+);([0-9]+);([0-9]+)@; filament_color_type: [\"${1}\", \"${2}\", \"${3}\", \"${4}\"]@@  Convert filament colour format");
+    def->tooltip = L("Sed-like regex/literal substitutions applied to G-code before post-processing scripts.\n\n")
+                     + gcode_substitutions_common_doc;
     def->gui_flags = "serialized";
     def->multiline = true;
     def->full_width = true;
@@ -2066,26 +2140,9 @@ void PrintConfigDef::init_fff_params()
     def = this->add("printer_gcode_substitutions", coStrings);
     def->label = L("Printer G-code Substitutions");
     def->tooltip = L("Printer-level sed-like regex/literal substitutions applied to G-code before post-processing scripts.\n"
-                     "These run after print-level substitutions, allowing printer-specific hardware workarounds.\n\n"
-                     "Each line: s/find/replace/flags  (regex) or  l/find/replace/flags  (literal)\n\n"
-                     "Delimiter can be any character after s or l. Choose a delimiter that does not appear\n"
-                     "in the pattern or replacement string. There is no escape mechanism for the delimiter.\n"
-                     "  e.g.: s@G1@G0@i  or  s#OLD#NEW#  or  s|find|replace|i\n\n"
-                     "Syntax Flags: i = case-insensitive, n = no-sub-match, c = collate, m = multiline\n"
-                     "Inline Modifier: s = match-newline (?s)\n"
-                     "Format Flags: f = format-first-only (replace first match only)\n\n"
-                     "Capture groups use ${1}, ${2}, ${3}, etc in the replacement string.\n\n"
-                     "Comments: anything after the 4th delimiter is ignored (useful for inline documentation).\n\n"
-                     "Note: Rules with the 'm' flag or containing \\n/\\r in find/replace are processed\n"
-                     "in a separate full-file pass. All other rules are applied per-line during streaming and cannot add newlines.\n\n"
-                     "Examples:\n"
-                     "  s/G1 F/G0 F/i/                    Replace G1 with G0, case-insensitive\n"
-                     "  l/M104/M109//                     Literal replace M104 with M109\n"
-                     "  s/M109 S[0-9]+/M109 S200/f/       Replace first M109 temp set to 200\n"
-                     "  s@G1 E-@G1 E@i@                   Replace retract moves\n"
-                     "  s@(;TYPE:Top solid infill)@${1}M221 S98@s@  Increase top infill flow to 98%\n"
-                     "  s@M221 S95@M221 S100@f@           Replace first occurrence of 95% flow with 100%\n"
-                     "  s@; filament_colour_type = ([0-9]+);([0-9]+);([0-9]+);([0-9]+)@; filament_color_type: [\"${1}\", \"${2}\", \"${3}\", \"${4}\"]@@  Convert filament colour format");
+                     "These run AFTER print-level substitutions (from gcode_substitutions), allowing\n"
+                     "printer-specific hardware workarounds that override or complement print profile rules.\n\n")
+                     + gcode_substitutions_common_doc;
     def->gui_flags = "serialized";
     def->multiline = true;
     def->full_width = true;
