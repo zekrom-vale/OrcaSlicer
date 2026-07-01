@@ -1408,17 +1408,6 @@ void GCodeProcessor::run_post_process()
                         }
                     }
 
-                    // Apply line-level substitution rules after all placeholder
-                    // processing and command-specific line insertions.
-                    // Rules needing full-file processing (multiline flag or
-                    // newlines in find/replace) are excluded and handled by
-                    // apply_gcode_substitutions() after the file is written.
-                    if (!gcode_line.empty() && !m_line_sub_rules.empty()) {
-                        for (auto &sub_rule : m_line_sub_rules) {
-                            apply_gcode_substitution_line(sub_rule, gcode_line);
-                        }
-                    }
-
                     if (!gcode_line.empty())
                         export_line.append_line(gcode_line);
                     export_line.write(out, 1.1f * max_backtrace_time, m_result, out_path);
@@ -2096,13 +2085,6 @@ void GCodeProcessor::apply_config(const PrintConfig& config)
     if (z_offset != nullptr)
         m_z_offset = z_offset->value;
 
-    // Parse substitution rules: line-level rules (no 'm' flag, no newlines
-    // in find/replace) are applied in the streaming loop; rules needing
-    // full-file processing are handled by apply_gcode_substitutions().
-    {
-        m_line_sub_rules = parse_gcode_substitution_rules(config, false);
-    }
-    
 }
 
 void GCodeProcessor::apply_config(const DynamicPrintConfig& config)
@@ -2433,13 +2415,6 @@ void GCodeProcessor::apply_config(const DynamicPrintConfig& config)
     const ConfigOptionFloat* z_offset = config.option<ConfigOptionFloat>("z_offset");
     if (z_offset != nullptr)
         m_z_offset = z_offset->value;
-
-    // Parse substitution rules: line-level rules (no 'm' flag, no newlines
-    // in find/replace) are applied in the streaming loop; rules needing
-    // full-file processing are handled by apply_gcode_substitutions().
-    {
-        m_line_sub_rules = parse_gcode_substitution_rules(config, false);
-    }
 }
 
 void GCodeProcessor::enable_stealth_time_estimator(bool enabled)

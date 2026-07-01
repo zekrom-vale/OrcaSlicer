@@ -267,10 +267,10 @@ static std::string process_escapes(const std::string& src)
 }
 
 // ---------------------------------------------------------------------------
-// Shared rule parsing and line-level substitution
+// Shared rule parsing and substitution
 // ---------------------------------------------------------------------------
 
-std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &config, bool target_multiline)
+std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &config)
 {
     const auto *print_subs   = config.opt<ConfigOptionStrings>("gcode_substitutions");
     const auto *printer_subs = config.opt<ConfigOptionStrings>("printer_gcode_substitutions");
@@ -329,8 +329,7 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
         return result;
     };
 
-    // Explicitly capture target_multiline to avoid scoping isolation
-    auto expand_rules = [&rules, target_multiline, &protect_escaped_braces, &restore_escaped_braces](const ConfigOptionStrings* subs) {
+    auto expand_rules = [&rules, &protect_escaped_braces, &restore_escaped_braces](const ConfigOptionStrings* subs) {
         for (const auto& raw_value : subs->values) {
             std::vector<std::string> lines;
             boost::split(lines, raw_value, boost::is_any_of("\r\n"), boost::token_compress_on);
@@ -373,28 +372,22 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
                     continue;
                 }
 
-                // Parse block-type flags: L = layer block, C = color/toolhead block.
-                // Block-type rules require full-file chunked processing.
+                // Parse block-type flags: C = color/toolhead block.
                 // The m flag is a regex flag that works within chunks normally.
                 GCodeSubBlockType block_type = GCodeSubBlockType::None;
-                bool has_L = flags.find('L') != std::string::npos;
                 bool has_C = flags.find('C') != std::string::npos;
-                if (has_L && has_C) {
-                    BOOST_LOG_TRIVIAL(warning) << "GCode substitution: both L and C flags set in rule. L takes precedence.";
-                }
-                if (has_L)
-                    block_type = GCodeSubBlockType::Line;
-                else if (has_C)
+                if (has_C)
                     block_type = GCodeSubBlockType::Color;
                 rule.block_type = block_type;
 
-                // Quick filter: drop rules that are clearly not applicable based on
-                // block-type flags alone, before doing expensive escape processing.
-                bool is_block_rule = block_type != GCodeSubBlockType::None;
-                if (target_multiline && !is_block_rule)
-                    continue;
-                if (!target_multiline && is_block_rule)
-                    continue;
+                // Warn on unknown flags — known flags: i, n, c, m, s, f, C.
+                for (char fc : flags) {
+                    if (fc != 'i' && fc != 'n' && fc != 'c' && fc != 'm' &&
+                        fc != 's' && fc != 'f' && fc != 'C') {
+                        BOOST_LOG_TRIVIAL(warning) << "GCode substitution: unknown flag '" << fc
+                            << "' in rule: " << line;
+                    }
+                }
 
                 // --- Escape processing pipeline ---
                 // Order matters:
@@ -453,7 +446,7 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
                 rule.case_insensitive  = case_insensitive;
                 rule.format_first_only = format_first_only;
 
-                // Pre-compile regex at parse time to avoid per-line compilation.
+                // Pre-compile regex at parse time to avoid per-chunk compilation.
                 if (rule.is_regex) {
                     std::string pattern = match_newline ? "(?s)" + rule.find : rule.find;
                     boost::regex::flag_type syntax_flags = boost::regex::normal;
@@ -480,27 +473,13 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
     if (has_print_subs)   expand_rules(print_subs);
     if (has_printer_subs) expand_rules(printer_subs);
 
-    BOOST_LOG_TRIVIAL(debug) << "parse_gcode_substitution_rules: multiline=" << target_multiline
-        << " rules_count=" << rules.size();
+    BOOST_LOG_TRIVIAL(debug) << "parse_gcode_substitution_rules: rules_count=" << rules.size();
     return rules;
 }
 
-// Helper: count newlines (\n and \r) in a string.
-static int count_newlines(const std::string& str)
-{
-    int count = 0;
-    for (char c : str) {
-        if (c == '\n' || c == '\r')
-            ++count;
-    }
-    return count;
-}
-
 // Shared helper: apply a single substitution rule (regex or literal) to a string.
-// warn_newlines: when true, emit a warning if the replacement introduces newlines
-//                (used only in single-line streaming mode).
 // Returns true if the string was modified.
-static bool apply_substitution_rule(GCodeSubRule &rule, std::string &src, bool warn_newlines)
+static bool apply_substitution_rule(GCodeSubRule &rule, std::string &src)
 {
     if (rule.is_regex) {
         if (!rule.compiled_regex)
@@ -519,19 +498,6 @@ static bool apply_substitution_rule(GCodeSubRule &rule, std::string &src, bool w
             src.begin(), src.end(),
             *rule.compiled_regex, rule.replace, format_flags
         );
-
-        if (warn_newlines) {
-            // In streaming mode, src is a single G-code line (no newlines), so
-            // newlines_in_src should be 0.  Just catches edge cases.
-            int newlines_in_replace = count_newlines(rule.replace);
-            int newlines_in_src     = count_newlines(src);
-            if (newlines_in_replace > newlines_in_src) {
-                throw Slic3r::RuntimeError(Slic3r::format(
-                    "GCode substitution failed: replacement introduces %1% newline(s) in single-line (streaming) mode. "
-                    "Line numbering would be corrupted. Use the L (layer block) or C (color block) flag for multiline replacements.",
-                    newlines_in_replace - newlines_in_src));
-            }
-        }
 
         src = std::move(result);
         return true;
@@ -567,18 +533,6 @@ static bool apply_substitution_rule(GCodeSubRule &rule, std::string &src, bool w
 
             if (rule.format_first_only) {
                 result.append(src, pos, std::string::npos);
-
-                if (warn_newlines) {
-                    int newlines_in_replace = count_newlines(rule.replace);
-                    int newlines_in_src     = count_newlines(src);
-                    if (newlines_in_replace > newlines_in_src) {
-                        throw Slic3r::RuntimeError(Slic3r::format(
-                            "GCode substitution failed: replacement introduces %1% newline(s) in single-line (streaming) mode. "
-                            "Line numbering would be corrupted. Use the L (layer block) or C (color block) flag for multiline replacements.",
-                            newlines_in_replace - newlines_in_src));
-                    }
-                }
-
                 src = std::move(result);
                 return true;
             }
@@ -593,38 +547,13 @@ static bool apply_substitution_rule(GCodeSubRule &rule, std::string &src, bool w
     if (!literal_match_found)
         return false;
 
-    if (warn_newlines) {
-        // Only error if the replacement introduces newlines that weren't already
-        // in the source. If the source already contains newlines (shouldn't happen
-        // in streaming mode, but guard against it), we still warn rather than fail.
-        int newlines_in_replace = count_newlines(rule.replace);
-        int newlines_in_src     = count_newlines(src);
-        if (newlines_in_replace > newlines_in_src) {
-            throw Slic3r::RuntimeError(Slic3r::format(
-                "GCode substitution failed: replacement introduces %1% newline(s) in single-line (streaming) mode. "
-                "Line numbering would be corrupted. Use the L (layer block) or C (color block) flag for multiline replacements.",
-                newlines_in_replace - newlines_in_src));
-        }
-    }
-
     result.append(src, pos, std::string::npos);
     src = std::move(result);
     return true;
 }
 
-// Apply a single substitution rule to a single gcode line (streaming, no full-file load).
-// Only line-level rules (without L/C block flags) should be passed here.
-// Returns true if the line was modified.
-bool apply_gcode_substitution_line(GCodeSubRule &rule, std::string &line)
-{
-    // Assertion: block-type rules should not reach the streaming path.
-    assert(rule.block_type == GCodeSubBlockType::None &&
-           "Block-type rule (L/C) should not be processed in streaming mode");
-    return apply_substitution_rule(rule, line, true);
-}
-
 // ---------------------------------------------------------------------------
-// Full-file (multiline) substitution — chunked by layer/color boundaries
+// Chunked substitution — processed by layer/color boundaries
 // ---------------------------------------------------------------------------
 
 // Fast string prefix checks for layer/color marker detection.
@@ -664,10 +593,9 @@ static bool is_color_marker(const std::string& line)
 
 // Apply a single substitution rule to a string (either regex or literal).
 // Returns true if the string was modified.
-// This is the chunked (block-level) variant — no newline warnings.
 static bool apply_rule_to_string(GCodeSubRule &rule, std::string &src)
 {
-    return apply_substitution_rule(rule, src, /* warn_newlines = */ false);
+    return apply_substitution_rule(rule, src);
 }
 
 // Apply rules to a string buffer. Updates modified flag if any rule matched.
@@ -719,8 +647,8 @@ static void flush_layer_chunk(
     layer_content.clear();
 }
 
-// Apply sed-like regex/literal substitutions streaming from in_path to out_path.
-// Uses streaming chunking: the file is read line-by-line and split at
+// Apply sed-like regex/literal substitutions from in_path to out_path.
+// Uses chunked processing: the file is read line-by-line and split at
 // layer/color boundaries. Rules are applied per-chunk based on their
 // block_type. Processed chunks are written directly to out_path — no
 // full-file accumulation in memory.
@@ -764,21 +692,18 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
         return false;
 
     try {
-        // Categorize rules by block type. All rules reaching this function are
-        // block-type rules (L/C flags). Per-line rules are handled by
-        // apply_gcode_substitution_line in the streaming loop.
+        // Categorize rules by block type.
+        // Non-block rules (no L/C flag) are treated as layer-level rules
+        // so they are applied within the layer chunk.
         // Cross layer regex is not supported.
-        std::vector<GCodeSubRule*> layer_rules;  // L flag — apply per layer chunk
+        std::vector<GCodeSubRule*> layer_rules;  // L flag or no flag — apply per layer chunk
         std::vector<GCodeSubRule*> color_rules;  // C flag — apply per color chunk
 
         for (auto &rule : all_rules) {
-            // Assertion: only block-type rules should reach this path.
-            assert(rule.block_type != GCodeSubBlockType::None &&
-                   "Non-block rule (line-level) should not be processed in block-mode");
-            if (rule.block_type == GCodeSubBlockType::Line)
-                layer_rules.push_back(&rule);
-            else if (rule.block_type == GCodeSubBlockType::Color)
+            if (rule.block_type == GCodeSubBlockType::Color)
                 color_rules.push_back(&rule);
+            else
+                layer_rules.push_back(&rule);
         }
 
         if (layer_rules.empty() && color_rules.empty())
@@ -865,9 +790,6 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
 }
 
 // Combined post-processor: applies substitutions then runs scripts.
-// Line-level substitution rules (without L/C flags) are already applied during
-// the streaming GCodeProcessor::run_post_process() loop. Only block-mode rules
-// (L/C flags) require the full-file apply_gcode_substitutions() pass here.
 //
 // I/O optimization: when multiline rules exist, apply_gcode_substitutions reads
 // from the original file and writes directly to the output — no intermediate
@@ -880,20 +802,21 @@ bool run_post_process(std::string &src_path, bool make_copy, const std::string &
 {
     const auto *post_process = config.opt<ConfigOptionStrings>("post_process");
 
-    // Parse multiline rules — line-level rules are handled in the streaming
-    // GCodeProcessor loop.
-    auto multiline_rules = parse_gcode_substitution_rules(config, true);
+    // Parse all substitution rules — applied via chunked post-processing.
+    auto sub_rules = parse_gcode_substitution_rules(config);
     bool has_scripts = post_process != nullptr && !post_process->values.empty();
+    // Capture emptiness before std::move(sub_rules) invalidates the vector.
+    bool had_sub_rules = !sub_rules.empty();
 
-    if (multiline_rules.empty() && !has_scripts)
+    if (!had_sub_rules && !has_scripts)
         return false;
 
     BOOST_LOG_TRIVIAL(debug) << "run_post_process: make_copy=" << make_copy
-        << " multiline_rules_count=" << multiline_rules.size()
+        << " sub_rules_count=" << sub_rules.size()
         << " has_scripts=" << has_scripts;
 
     // Determine output path: .pp for isolated copy (make_copy), original for in-place.
-    std::string tmp_path = make_copy || !multiline_rules.empty() ? (src_path + ".pp") : src_path;
+    std::string tmp_path = make_copy || had_sub_rules ? (src_path + ".pp") : src_path;
 
     try {
         // Remove stale temp file if it exists.
@@ -904,10 +827,10 @@ bool run_post_process(std::string &src_path, bool make_copy, const std::string &
             BOOST_LOG_TRIVIAL(error) << Slic3r::format("Failed deleting an old temporary file %1%: %2%", tmp_path, err.what());
         }
 
-        // --- Step 1: Apply multiline substitutions ---
-        if (!multiline_rules.empty()) {
+        // --- Step 1: Apply substitutions ---
+        if (had_sub_rules) {
             // Read from original, write directly to tmp_path — no intermediate copy.
-            apply_gcode_substitutions(src_path, tmp_path, std::move(multiline_rules));
+            apply_gcode_substitutions(src_path, tmp_path, std::move(sub_rules));
         }
         // --- Step 2: If no rules but isolation needed, make a plain copy ---
         else if (make_copy) {
@@ -927,13 +850,13 @@ bool run_post_process(std::string &src_path, bool make_copy, const std::string &
             // In-place: move the src path
             src_path = std::move(tmp_path);
         }
-        else if (!multiline_rules.empty()) {
+        else if (had_sub_rules) {
             // In-place: rename .tmp over original.
             boost::filesystem::rename(tmp_path, src_path);
         }
     } catch (...) {
         // Clean up temp file on error.
-        if (!multiline_rules.empty()||make_copy) {
+        if (had_sub_rules || make_copy) {
             try {
                 if (boost::filesystem::exists(tmp_path))
                     boost::filesystem::remove(tmp_path);

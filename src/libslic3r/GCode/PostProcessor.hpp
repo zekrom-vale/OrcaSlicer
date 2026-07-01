@@ -13,16 +13,14 @@
 namespace Slic3r {
 
 // Block type for substitution rules — controls the scope of the substitution.
-// None = single-line (default), Line = layer block, Color = color/toolhead block.
+// None = layer block (default), Color = color/toolhead block.
 enum class GCodeSubBlockType : uint8_t
 {
-    None  = 0,  // single-line mode (default)
-    Line  = 1,  // L flag — block spans lines within a layer
+    None  = 0,  // layer block (default)
     Color = 2,  // C flag — block spans lines within a color/toolhead section
 };
 
-// Parsed substitution rule — shared between streaming (line-level) and
-// full-file (multiline) processing paths.
+// Parsed substitution rule — applied via chunked full-file processing.
 struct GCodeSubRule
 {
     bool        is_regex;
@@ -32,21 +30,14 @@ struct GCodeSubRule
     // Flags needed at runtime for literal substitution and format bitmask.
     bool case_insensitive  = false;
     bool format_first_only = false;
-    // Pre-compiled regex — set during parsing to avoid per-line compilation.
+    // Pre-compiled regex — set during parsing to avoid per-chunk compilation.
     std::optional<boost::regex> compiled_regex;
 };
 
 // Parse the raw substitution config options into a vector of GCodeSubRule.
-// When target_multiline is true, only block-type rules (L/C flags) are
-// returned (these require full-file chunked processing). When
-// target_multiline is false, only line-level rules are returned (for streaming).
+// Returns all defined substitution rules as a single flat vector.
 // Returns an empty vector when no rules are defined.
-extern std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &config, bool target_multiline);
-
-// Apply a single line-level substitution rule to a single gcode line.
-// Returns true if the line was modified.
-// Only line-level rules (without L/C block flags) should be passed here.
-extern bool apply_gcode_substitution_line(GCodeSubRule &rule, std::string &line);
+extern std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &config);
 
 // Run post processing script / scripts if defined.
 // Returns true if a post-processing script was executed.
@@ -58,7 +49,7 @@ extern bool apply_gcode_substitution_line(GCodeSubRule &rule, std::string &line)
 // The post-processing script may change the output_name.
 extern bool run_post_process_scripts(std::string &src_path, const std::string &host, std::string &output_name, const DynamicPrintConfig &config);
 
-// Apply sed-like regex/literal substitutions streaming from in_path to out_path.
+// Apply sed-like regex/literal substitutions from in_path to out_path.
 // Each line: s/find/replace/flags  (regex) or  l/find/replace/flags  (literal)
 // Delimiter can be any character after s/l.
 // Syntax Flags: i = case-insensitive, n = no-sub-match, c = collate, m = multiline.

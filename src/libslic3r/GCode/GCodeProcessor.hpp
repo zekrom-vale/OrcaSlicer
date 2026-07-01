@@ -832,9 +832,6 @@ class Print;
         float m_preheat_time;
         int m_preheat_steps;
         bool m_disable_m73;
-        // Line-level substitution rules (without 'm' flag) — applied in the streaming loop.
-        std::vector<GCodeSubRule> m_line_sub_rules;
-
         enum class EProducer
         {
             Unknown,
