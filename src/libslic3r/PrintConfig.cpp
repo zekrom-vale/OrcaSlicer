@@ -2120,29 +2120,29 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionString("M104 S0 ; turn off temperature\nG28 X0  ; home X axis\nM84     ; disable motors\n"));
 
-    def = this->add("gcode_substitutions", coStrings);
+    def = this->add("gcode_substitutions", coString);
     def->label = L("G-code Substitutions");
-    def->tooltip = L("Sed-like regex/literal substitutions applied to G-code before post-processing scripts.\n\n")
-                     + gcode_substitutions_common_doc;
+    def->tooltip = std::string(L("Sed-like regex/literal substitutions applied to G-code before post-processing scripts.\n\n"))
+                      + gcode_substitutions_common_doc;
     def->gui_flags = "serialized";
     def->multiline = true;
     def->full_width = true;
     def->height = 6;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionStrings());
+    def->set_default_value(new ConfigOptionString());
 
-    def = this->add("printer_gcode_substitutions", coStrings);
+    def = this->add("printer_gcode_substitutions", coString);
     def->label = L("Printer G-code Substitutions");
-    def->tooltip = L("Printer-level sed-like regex/literal substitutions applied to G-code before post-processing scripts.\n"
-                     "These run AFTER print-level substitutions (from gcode_substitutions), allowing\n"
-                     "printer-specific hardware workarounds that override or complement print profile rules.\n\n")
-                     + gcode_substitutions_common_doc;
+    def->tooltip = std::string(L("Printer-level sed-like regex/literal substitutions applied to G-code before post-processing scripts.\n"
+                      "These run AFTER print-level substitutions (from gcode_substitutions), allowing\n"
+                      "printer-specific hardware workarounds that override or complement print profile rules.\n\n"))
+                      + gcode_substitutions_common_doc;
     def->gui_flags = "serialized";
     def->multiline = true;
     def->full_width = true;
     def->height = 6;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionStrings());
+    def->set_default_value(new ConfigOptionString());
 
     def             = this->add("printing_by_object_gcode", coString);
     def->label      = L("Between Object G-code");

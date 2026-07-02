@@ -272,11 +272,11 @@ static std::string process_escapes(const std::string& src)
 
 std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &config)
 {
-    const auto *print_subs   = config.opt<ConfigOptionStrings>("gcode_substitutions");
-    const auto *printer_subs = config.opt<ConfigOptionStrings>("printer_gcode_substitutions");
+    const auto *print_subs   = config.option<ConfigOptionString>("gcode_substitutions");
+    const auto *printer_subs = config.option<ConfigOptionString>("printer_gcode_substitutions");
 
-    bool has_print_subs   = print_subs != nullptr && !print_subs->values.empty();
-    bool has_printer_subs = printer_subs != nullptr && !printer_subs->values.empty();
+    bool has_print_subs   = print_subs != nullptr && !print_subs->value.empty();
+    bool has_printer_subs = printer_subs != nullptr && !printer_subs->value.empty();
 
     if (!has_print_subs && !has_printer_subs)
         return {};
@@ -329,11 +329,10 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
         return result;
     };
 
-    auto expand_rules = [&rules, &protect_escaped_braces, &restore_escaped_braces](const ConfigOptionStrings* subs) {
-        for (const auto& raw_value : subs->values) {
-            std::vector<std::string> lines;
-            boost::split(lines, raw_value, boost::is_any_of("\r\n"), boost::token_compress_on);
-            for (auto &line : lines) {
+    auto expand_rules = [&rules, &protect_escaped_braces, &restore_escaped_braces](const ConfigOptionString* subs) {
+        std::vector<std::string> lines;
+        boost::split(lines, subs->value, boost::is_any_of("\r\n"), boost::token_compress_on);
+        for (auto &line : lines) {
                 boost::trim(line);
                 if (line.empty() || line.size() < 4 || (line[0] != 's' && line[0] != 'l'))
                     continue;
@@ -448,12 +447,13 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
 
                 // Pre-compile regex at parse time to avoid per-chunk compilation.
                 if (rule.is_regex) {
-                    std::string pattern = match_newline ? "(?s)" + rule.find : rule.find;
+                    std::string pattern = rule.find;
+                    if (match_newline)  pattern = "(?s)" + pattern;
+                    if (has_m_flag)     pattern = "(?m)" + pattern;
                     boost::regex::flag_type syntax_flags = boost::regex::normal;
-                    if (case_insensitive) syntax_flags |= boost::regex::icase;
-                    if (no_sub_match)     syntax_flags |= boost::regex::no_sub_match;
-                    if (collate)          syntax_flags |= boost::regex::collate;
-                    if (has_m_flag)       syntax_flags |= boost::regex::multiline;
+                    if (case_insensitive) syntax_flags |= boost::regex_constants::icase;
+                    if (no_sub_match)     syntax_flags |= boost::regex_constants::nosubs;
+                    if (collate)          syntax_flags |= boost::regex_constants::collate;
                     try {
                         rule.compiled_regex = boost::regex(pattern, syntax_flags);
                     } catch (const boost::regex_error &re_err) {
@@ -467,7 +467,6 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
                     << " find=" << rule.find;
                 rules.push_back(std::move(rule));
             }
-        }
     };
 
     if (has_print_subs)   expand_rules(print_subs);
@@ -512,8 +511,8 @@ static bool apply_substitution_rule(GCodeSubRule &rule, std::string &src)
         size_t found_pos = std::string::npos;
 
         if (rule.case_insensitive) {
-            auto it = boost::ifind_first(
-                boost::make_iterator_range(src.begin() + pos, src.end()), rule.find);
+            auto range = boost::make_iterator_range(src.begin() + pos, src.end());
+            auto it = boost::ifind_first(range, rule.find);
             if (it) {
                 found_pos = static_cast<size_t>(std::distance(src.begin(), it.begin()));
             }
@@ -572,7 +571,7 @@ static bool is_layer_marker(const std::string& line)
         ++pos;
 
     std::string_view sv(line.data() + pos, line.size() - pos);
-    return sv.starts_with("LAYER_CHANGE") || sv.starts_with("CHANGE_LAYER");
+    return sv.compare(0, 12, "LAYER_CHANGE") == 0 || sv.compare(0, 12, "CHANGE_LAYER") == 0;
 }
 
 // Check if a line starts with a color change marker.
@@ -588,7 +587,7 @@ static bool is_color_marker(const std::string& line)
         ++pos;
 
     std::string_view sv(line.data() + pos, line.size() - pos);
-    return sv.starts_with("CP TOOLCHANGE START");
+    return sv.compare(0, 19, "CP TOOLCHANGE START") == 0;
 }
 
 // Apply a single substitution rule to a string (either regex or literal).
@@ -711,7 +710,7 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
 
         bool modified = false;
 
-        // --- Streaming chunked processing (L/C rules) ---
+        // --- Chunked processing (L/C rules) ---
         // Hierarchical: layer → color. Read line by line, accumulate color chunks,
         // process color rules and append to layer_content, process layer rules
         // and write directly to output file.
@@ -731,9 +730,14 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
             std::string line;
             int layer_count = 0;
             int color_count = 0;
-            while (std::getline(std::istream(in.f), line)) {
+            char buf[4096];
+            while (fgets(buf, sizeof(buf), in.f)) {
+                line.assign(buf);
                 // Strip trailing \r from \r\n line endings (file is opened in binary mode).
                 if (!line.empty() && line.back() == '\r')
+                    line.pop_back();
+                // Strip trailing \n — fgets includes it, and we add it back with push_back('\n') below.
+                if (!line.empty() && line.back() == '\n')
                     line.pop_back();
 
                 // ;LAYER_CHANGE

@@ -2778,6 +2778,13 @@ void TabPrint::build()
         option.opt.height = 15;
         optgroup->append_single_option_line(option, "others_settings_post_processing_scripts");
 
+        optgroup = page->new_optgroup(L("G-code Substitutions"), L"param_gcode", 0);
+        option = optgroup->get_option("gcode_substitutions");
+        option.opt.full_width = true;
+        option.opt.is_code = true;
+        option.opt.height = 15;
+        optgroup->append_single_option_line(option);
+
         optgroup = page->new_optgroup(L("Notes"), "note", 0);
         option = optgroup->get_option("notes");
         option.opt.full_width = true;
@@ -4692,6 +4699,13 @@ void TabPrinter::build_fff()
         option.opt.is_code = true;
         option.opt.height = gcode_field_height;//150;
         optgroup->append_single_option_line(option, "printer_machine_gcode#template-custom-g-code");
+
+        optgroup = page->new_optgroup(L("Printer G-code Substitutions"), L"param_gcode", 0);
+        option = optgroup->get_option("printer_gcode_substitutions");
+        option.opt.full_width = true;
+        option.opt.is_code = true;
+        option.opt.height = 15;
+        optgroup->append_single_option_line(option);
 
     page = add_options_page(L("Notes"), "custom-gcode_note"); // ORCA: icon only visible on placeholders
         optgroup = page->new_optgroup(L("Notes"), "note", 0);
