@@ -1,8 +1,11 @@
 #include "PostProcessor.hpp"
 
+#include "GCodeProcessor.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/format.hpp"
 #include "libslic3r/I18N.hpp"
+#include "libslic3r/PlaceholderParser.hpp"
+#include "libslic3r/Exception.hpp"
 
 #include <boost/algorithm/string.hpp>
 #include <boost/log/trivial.hpp>
@@ -379,13 +382,41 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
                     block_type = GCodeSubBlockType::Color;
                 rule.block_type = block_type;
 
-                // Warn on unknown flags — known flags: i, n, c, m, s, f, C.
+                // Parse M flag — metadata-only mode (skip preamble/suffix).
+                bool has_M = flags.find('M') != std::string::npos;
+                rule.metadata_only = has_M;
+
+                // Warn on unknown flags — known flags: i, n, c, m, s, f, C, M.
                 for (char fc : flags) {
                     if (fc != 'i' && fc != 'n' && fc != 'c' && fc != 'm' &&
-                        fc != 's' && fc != 'f' && fc != 'C') {
+                        fc != 's' && fc != 'f' && fc != 'C' && fc != 'M') {
                         BOOST_LOG_TRIVIAL(warning) << "GCode substitution: unknown flag '" << fc
                             << "' in rule: " << line;
                     }
+                }
+
+                // Detect macro variables in replacement string: {identifier} pattern.
+                // Scan for '{' followed by a letter or underscore, where '{' is NOT
+                // preceded by '\' (escaped brace), '$' (regex back-reference), or
+                // '\g' (boost regex named group reference).
+                {
+                    bool found_macro = false;
+                    for (size_t i = 0; i < rule.replace.size(); ++i) {
+                        if (rule.replace[i] == '{') {
+                            // Check this is not an escaped brace or regex syntax.
+                            bool is_escaped = (i > 0 && rule.replace[i - 1] == '\\');
+                            bool is_backref = (i > 0 && rule.replace[i - 1] == '$');
+                            bool is_named_group = (i > 1 && rule.replace[i - 1] == 'g' && rule.replace[i - 2] == '\\');
+                            if (!is_escaped && !is_backref && !is_named_group && i + 1 < rule.replace.size()) {
+                                char next = rule.replace[i + 1];
+                                if (std::isalpha(static_cast<unsigned char>(next)) || next == '_') {
+                                    found_macro = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    rule.macro_meta.has_macros = found_macro;
                 }
 
                 // --- Escape processing pipeline ---
@@ -555,14 +586,361 @@ static bool apply_substitution_rule(GCodeSubRule &rule, std::string &src)
 // Chunked substitution — processed by layer/color boundaries
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Brace protection/restoration for macro evaluation
+// ---------------------------------------------------------------------------
+
+// Protect literal braces in a replacement string before PlaceholderParser evaluation.
+// Two-phase algorithm:
+//   Phase 1 — Shield regex syntax FIRST: ${...} and \g{...} patterns
+//   Phase 2 — Shield remaining literal braces: '{' not followed by letter/underscore
+static std::string protect_literal_braces(const std::string& input)
+{
+    std::string result;
+    result.reserve(input.size());
+
+    // Phase 1: Shield ${...} and \g{...} patterns.
+    // These are regex back-references and named group references that must NOT
+    // be passed to PlaceholderParser.
+    {
+        size_t i = 0;
+        while (i < input.size()) {
+            // Check for ${...} pattern
+            if (i + 1 < input.size() && input[i] == '$' && input[i + 1] == '{') {
+                result.push_back(OPEN_BRACE_SENTINEL);
+                i += 2; // skip ${
+                // Find matching }
+                while (i < input.size() && input[i] != '}')
+                    result.push_back(input[i++]);
+                if (i < input.size()) {
+                    result.push_back(CLOSE_BRACE_SENTINEL);
+                    ++i; // skip }
+                }
+                continue;
+            }
+            // Check for \g{...} pattern
+            if (i + 1 < input.size() && input[i] == '\\' && input[i + 1] == 'g') {
+                if (i + 2 < input.size() && input[i + 2] == '{') {
+                    result.push_back('\\');
+                    result.push_back('g');
+                    result.push_back(OPEN_BRACE_SENTINEL);
+                    i += 3; // skip \g{
+                    // Find matching }
+                    while (i < input.size() && input[i] != '}')
+                        result.push_back(input[i++]);
+                    if (i < input.size()) {
+                        result.push_back(CLOSE_BRACE_SENTINEL);
+                        ++i; // skip }
+                    }
+                    continue;
+                }
+            }
+            result.push_back(input[i++]);
+        }
+    }
+
+    // Phase 2: Shield remaining literal braces.
+    // '{' followed by letter/underscore is a macro variable — leave as-is.
+    // All other '{' are literal — replace with sentinel.
+    {
+        std::string phase2;
+        phase2.reserve(result.size());
+        for (size_t i = 0; i < result.size(); ++i) {
+            if (result[i] == '{') {
+                // Check if next char is a letter or underscore (macro variable).
+                if (i + 1 < result.size()) {
+                    char next = result[i + 1];
+                    if (std::isalpha(static_cast<unsigned char>(next)) || next == '_') {
+                        // This is a macro variable — leave as-is.
+                        phase2.push_back('{');
+                        continue;
+                    }
+                }
+                // Literal brace — replace with sentinel.
+                phase2.push_back(OPEN_BRACE_SENTINEL);
+            } else if (result[i] == '}') {
+                // Check if preceded by a letter/digit (end of macro variable).
+                if (i > 0) {
+                    char prev = phase2.back();
+                    if (std::isalnum(static_cast<unsigned char>(prev)) || prev == '_') {
+                        // This is end of macro variable — leave as-is.
+                        phase2.push_back('}');
+                        continue;
+                    }
+                }
+                // Literal brace — replace with sentinel.
+                phase2.push_back(CLOSE_BRACE_SENTINEL);
+            } else {
+                phase2.push_back(result[i]);
+            }
+        }
+        result = std::move(phase2);
+    }
+
+    return result;
+}
+
+// Restore sentinel characters back to literal braces after PlaceholderParser evaluation.
+static std::string restore_literal_braces(const std::string& input)
+{
+    std::string result;
+    result.reserve(input.size());
+    for (char c : input) {
+        if (c == OPEN_BRACE_SENTINEL)
+            result.push_back('{');
+        else if (c == CLOSE_BRACE_SENTINEL)
+            result.push_back('}');
+        else
+            result.push_back(c);
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// G-code header parsing and layer Z/height extraction
+// ---------------------------------------------------------------------------
+
+// Parse the G-code header block to extract global variables.
+// Collects lines between "; HEADER_BLOCK_START" and "; HEADER_BLOCK_END".
+// Returns a map of variable name → value (vectorized values stored as comma-separated strings).
+// Tolerant of spacing, order, and missing fields for compatibility flexibility.
+// Only recognized keys are extracted; unknown keys are ignored.
+static std::unordered_map<std::string, std::string> parse_gcode_header(
+    const std::string& header_content)
+{
+    std::unordered_map<std::string, std::string> vars;
+
+    // Collect lines between HEADER_BLOCK_START and HEADER_BLOCK_END.
+    // Skip CONFIG_BLOCK sections to avoid picking up gcode_substitutions
+    // values that contain {var} patterns which could be misinterpreted.
+    // The CONFIG_BLOCK ends at EXECUTABLE_BLOCK_END.
+    bool in_header = false;
+    bool in_config_block = false;
+    std::istringstream iss(header_content);
+    std::string line;
+    while (std::getline(iss, line)) {
+        // Trim whitespace.
+        boost::trim(line);
+        if (line.find("HEADER_BLOCK_START") != std::string::npos) {
+            in_header = true;
+            continue;
+        }
+        if (line.find("HEADER_BLOCK_END") != std::string::npos) {
+            in_header = false;
+            break;
+        }
+        if (!in_header)
+            continue;
+
+        // Skip CONFIG_BLOCK sections — they contain gcode_substitutions
+        // values with {var} patterns that should not be parsed as header vars.
+        if (line.find("CONFIG_BLOCK") != std::string::npos) {
+            in_config_block = true;
+            continue;
+        }
+        if (in_config_block && line.find("EXECUTABLE_BLOCK_END") != std::string::npos) {
+            in_config_block = false;
+            continue;
+        }
+        if (in_config_block)
+            continue;
+
+        // Strip leading "; " and whitespace.
+        size_t pos = 0;
+        while (pos < line.size() && (line[pos] == ';' || line[pos] == ' ' || line[pos] == '\t'))
+            ++pos;
+        if (pos >= line.size())
+            continue;
+
+        // Find the colon separator.
+        size_t colon = line.find(':', pos);
+        if (colon == std::string::npos)
+            continue;
+
+        std::string key = line.substr(pos, colon - pos);
+        std::string val = line.substr(colon + 1);
+
+        // Trim whitespace from key and value.
+        while (!key.empty() && std::isspace(static_cast<unsigned char>(key.back())))
+            key.pop_back();
+        while (!val.empty() && std::isspace(static_cast<unsigned char>(val.front())))
+            val.erase(val.begin());
+        while (!val.empty() && std::isspace(static_cast<unsigned char>(val.back())))
+            val.pop_back();
+
+        if (key.empty() || val.empty())
+            continue;
+
+        // Only extract recognized keys.
+        // Vectorized values (filament_density, filament_diameter) are stored as-is
+        // (comma-separated) and split by PlaceholderParser when indexed.
+        if (key == "total layer number")
+            vars["total_layer_count"] = val;
+        else if (key == "max_z_height")
+            vars["max_z_height"] = val;
+        else if (key == "filament_density")
+            vars["filament_density"] = val;
+        else if (key == "filament_diameter")
+            vars["filament_diameter"] = val;
+    }
+
+    return vars;
+}
+
+// Parse layer Z from a comment line using tag variants from GCodeProcessor.
+// BBL: "; LAYER_HEIGHT: X"  →  extract X as layer_z
+// Compatible: ";HEIGHT:X"   →  extract X as layer_z
+static std::optional<double> parse_layer_z(const std::string& line)
+{
+    auto [bbl, compat] = GCodeProcessor::reserved_tag_variants(GCodeProcessor::ETags::Height);
+    // Strip leading space from tag variants.
+    std::string_view bbl_sv = bbl;
+    std::string_view compat_sv = compat;
+    while (!bbl_sv.empty() && bbl_sv.front() == ' ')
+        bbl_sv.remove_prefix(1);
+    while (!compat_sv.empty() && compat_sv.front() == ' ')
+        compat_sv.remove_prefix(1);
+
+    // Try BBL format: "; LAYER_HEIGHT: X"
+    {
+        size_t start = 0;
+        while (start < line.size() && line[start] == ' ')
+            ++start;
+        if (start < line.size() && line[start] == ';') {
+            std::string_view sv(line.data() + start, line.size() - start);
+            if (sv.compare(0, bbl_sv.size(), bbl_sv) == 0) {
+                std::string val{sv.substr(bbl_sv.size())};
+                try { return std::stod(val); }
+                catch (...) {}
+            }
+        }
+    }
+
+    // Try compatible format: ";HEIGHT:X"
+    {
+        size_t start = 0;
+        while (start < line.size() && line[start] == ' ')
+            ++start;
+        if (start < line.size() && line[start] == ';') {
+            std::string_view sv(line.data() + start, line.size() - start);
+            if (sv.compare(0, compat_sv.size(), compat_sv) == 0) {
+                std::string val{sv.substr(compat_sv.size())};
+                try { return std::stod(val); }
+                catch (...) {}
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
+// MacroScopeManager — manages PlaceholderParser config for scope transitions
+// ---------------------------------------------------------------------------
+
+// Lightweight scope manager for PlaceholderParser.
+// Manages adding/removing scoped variables as we enter/exit chunks.
+class MacroScopeManager
+{
+public:
+    MacroScopeManager(PlaceholderParser& parser, int total_layers)
+        : m_parser(parser), m_total_layers(total_layers) {}
+
+    // Enter preamble or suffix (global scope — no layer/color vars).
+    void enter_global() { m_in_layer = false; }
+
+    // Enter a layer chunk. Layer vars become available.
+    // Layer indexing is 0-based to match G-code layer markers (layer 0 = first layer).
+    void enter_layer(int layer_num, double layer_z, double layer_height)
+    {
+        m_in_layer = true;
+        m_layer_num = layer_num;
+        m_parser.set("layer_num", layer_num);
+        m_parser.set("layer_z", layer_z);
+        m_parser.set("layer_height", layer_height);
+        m_parser.set("first_layer", layer_num == 0);
+        m_parser.set("last_layer", layer_num == m_total_layers - 1);
+    }
+
+    // Update Z and height after the Height tag is parsed.
+    // Called when the Height tag appears after enter_layer() was already called.
+    void update_layer_z(double layer_z, double layer_height)
+    {
+        m_parser.set("layer_z", layer_z);
+        m_parser.set("layer_height", layer_height);
+    }
+
+    // Enter a color block within a layer. Color vars become available.
+    void enter_color(int color_num, int tool_num)
+    {
+        m_color_num = color_num;
+        m_parser.set("color_num", color_num);
+        m_parser.set("tool_num", tool_num);
+    }
+
+    // Exit a color block. Color vars are removed.
+    void exit_color()
+    {
+        m_parser.config_writable().erase("color_num");
+        m_parser.config_writable().erase("tool_num");
+    }
+
+    // Exit a layer chunk. Layer vars are removed.
+    void exit_layer()
+    {
+        m_parser.config_writable().erase("layer_num");
+        m_parser.config_writable().erase("layer_z");
+        m_parser.config_writable().erase("layer_height");
+        m_parser.config_writable().erase("first_layer");
+        m_parser.config_writable().erase("last_layer");
+        m_in_layer = false;
+    }
+
+    // Check if we are currently inside a layer chunk.
+    bool in_layer() const { return m_in_layer; }
+
+private:
+    PlaceholderParser& m_parser;
+    int m_total_layers;
+    bool m_in_layer = false;
+    int m_layer_num = 0;
+    int m_color_num = 0;
+};
+
+// Evaluate a replacement string through PlaceholderParser with brace protection.
+// Returns the resolved string. On error, logs a warning and returns the original
+// unresolved replacement (graceful degradation).
+static std::string evaluate_replacement(
+    const std::string& raw_replacement,
+    PlaceholderParser& parser)
+{
+    // Protect literal braces (two-phase: shield regex syntax first, then generic).
+    std::string protected_replacement = protect_literal_braces(raw_replacement);
+
+    // Evaluate through PlaceholderParser.
+    std::string resolved;
+    try {
+        resolved = parser.process(protected_replacement, 0);
+    } catch (const Slic3r::PlaceholderParserError& e) {
+        // Graceful degradation — log warning, return original replacement unresolved.
+        BOOST_LOG_TRIVIAL(warning) << "GCode macro evaluation failed: " << e.what()
+            << "\nReplacement: " << raw_replacement;
+        return raw_replacement;
+    }
+
+    // Restore literal braces.
+    return restore_literal_braces(resolved);
+}
+
 // Fast string prefix checks for layer/color marker detection.
 // Avoids regex overhead on every line of a multi-million-line G-code file.
 
 // Check if a line starts with a layer change marker.
-// Accepts "; CHANGE_LAYER", ";CHANGE_LAYER", "; LAYER_CHANGE", ";LAYER_CHANGE".
+// Uses reserved_tag_variants() to detect both BBL and compatible tag formats.
+// BBL: "; CHANGE_LAYER", Compatible: ";LAYER_CHANGE"
 static bool is_layer_marker(const std::string& line)
 {
-    if (line.size() < 14 || line[0] != ';')
+    if (line.empty() || line[0] != ';')
         return false;
 
     // Skip the semicolon and any optional spaces
@@ -571,42 +949,109 @@ static bool is_layer_marker(const std::string& line)
         ++pos;
 
     std::string_view sv(line.data() + pos, line.size() - pos);
-    return sv.compare(0, 12, "LAYER_CHANGE") == 0 || sv.compare(0, 12, "CHANGE_LAYER") == 0;
+    auto [bbl, compat] = GCodeProcessor::reserved_tag_variants(GCodeProcessor::ETags::Layer_Change);
+    // Strip leading space from tag variants (tags include leading space for G-code generation).
+    std::string_view bbl_sv = bbl;
+    std::string_view compat_sv = compat;
+    if (bbl_sv.size() > 1 && bbl_sv[0] == ' ')
+        bbl_sv.remove_prefix(1);
+    if (compat_sv.size() > 1 && compat_sv[0] == ' ')
+        compat_sv.remove_prefix(1);
+    return sv.compare(0, bbl_sv.size(), bbl_sv) == 0 || sv.compare(0, compat_sv.size(), compat_sv) == 0;
 }
 
-// Check if a line starts with a color change marker.
-// Accepts "; CP TOOLCHANGE START", ";CP TOOLCHANGE START".
-static bool is_color_marker(const std::string& line)
+// Detect bare T commands (T0, T1, T2, ...) — tool changes / color boundaries.
+static bool is_bare_t_command(const std::string& line)
 {
-    if (line.size() < 21 || line[0] != ';')
+    if (line.empty())
         return false;
 
-    // Skip the semicolon and any optional spaces
-    size_t pos = 1;
+    size_t pos = 0;
     while (pos < line.size() && line[pos] == ' ')
         ++pos;
+    return pos < line.size() && line[pos] == 'T' && pos + 1 < line.size() &&
+        std::isdigit(static_cast<unsigned char>(line[pos + 1]));
+}
 
-    std::string_view sv(line.data() + pos, line.size() - pos);
-    return sv.compare(0, 19, "CP TOOLCHANGE START") == 0;
+// Detect the EXECUTABLE_BLOCK_START marker — separates preamble from first layer.
+static bool is_executable_block_start(const std::string& line)
+{
+    return line.find("EXECUTABLE_BLOCK_START") != std::string::npos;
+}
+
+// Detect the EXECUTABLE_BLOCK_END marker — separates last layer from suffix.
+static bool is_executable_block_end(const std::string& line)
+{
+    return line.find("EXECUTABLE_BLOCK_END") != std::string::npos;
+}
+
+// Escape regex special characters in a replacement string to prevent
+// regex injection when macro variables resolve to strings containing
+// regex formatting characters like $1 or \1.
+static std::string escape_regex_replacement(const std::string& resolved)
+{
+    std::string escaped;
+    escaped.reserve(resolved.size() * 2);
+    for (char c : resolved) {
+        if (c == '\\' || c == '$') {
+            escaped.push_back('\\');
+            escaped.push_back(c);
+        } else {
+            escaped.push_back(c);
+        }
+    }
+    return escaped;
 }
 
 // Apply a single substitution rule to a string (either regex or literal).
+// If the rule has macros and a PlaceholderParser is available, evaluates the
+// replacement through the parser before applying the substitution.
 // Returns true if the string was modified.
-static bool apply_rule_to_string(GCodeSubRule &rule, std::string &src)
+static bool apply_rule_to_string(GCodeSubRule &rule, std::string &src,
+    PlaceholderParser* parser)
 {
+    // If rule has macros and parser is available, evaluate replacement lazily.
+    if (rule.macro_meta.has_macros && parser) {
+        std::string resolved = evaluate_replacement(rule.replace, *parser);
+        // Escape regex special characters to prevent injection from resolved macros.
+        std::string safe_resolved = escape_regex_replacement(resolved);
+        // Swap replacement temporarily. String move is O(1) — no allocation.
+        // Wrap in try/catch to guarantee restoration if apply_substitution_rule throws.
+        std::string tmp = std::move(rule.replace);
+        rule.replace = std::move(safe_resolved);
+        try {
+            bool changed = apply_substitution_rule(rule, src);
+            rule.replace = std::move(tmp);
+            return changed;
+        } catch (...) {
+            // Restore original replacement on exception to prevent state corruption.
+            rule.replace = std::move(tmp);
+            throw;
+        }
+    }
     return apply_substitution_rule(rule, src);
 }
 
 // Apply rules to a string buffer. Updates modified flag if any rule matched.
+// M-flagged (metadata_only) rules run ONLY on preamble/suffix (in_layer=false).
+// Non-M rules run ONLY on layer/color chunks (in_layer=true).
 static void apply_rules_to_string(
     std::string &buf,
     const std::vector<GCodeSubRule*> &rules,
-    bool &modified)
+    bool &modified,
+    PlaceholderParser* parser,
+    bool in_layer)
 {
     if (buf.empty() || rules.empty())
         return;
     for (auto *rule : rules) {
-        if (apply_rule_to_string(*rule, buf))
+        // M-flagged rules: run ONLY on preamble/suffix (skip when in a layer).
+        if (rule->metadata_only && in_layer)
+            continue;
+        // Non-M rules: run ONLY on layer/color chunks (skip preamble/suffix).
+        if (!rule->metadata_only && !in_layer)
+            continue;
+        if (apply_rule_to_string(*rule, buf, parser))
             modified = true;
     }
 }
@@ -618,12 +1063,14 @@ static void flush_color_chunk(
     std::string &color_chunk,
     const std::vector<GCodeSubRule*> &color_rules,
     std::string &dest,
-    bool &modified)
+    bool &modified,
+    PlaceholderParser* parser,
+    bool in_layer)
 {
     if (color_chunk.empty())
         return;
 
-    apply_rules_to_string(color_chunk, color_rules, modified);
+    apply_rules_to_string(color_chunk, color_rules, modified, parser, in_layer);
     dest.append(color_chunk);
     color_chunk.clear();
 }
@@ -634,12 +1081,14 @@ static void flush_layer_chunk(
     std::string &layer_content,
     const std::vector<GCodeSubRule*> &layer_rules,
     FILE *out,
-    bool &modified)
+    bool &modified,
+    PlaceholderParser* parser,
+    bool in_layer)
 {
     if (layer_content.empty())
         return;
 
-    apply_rules_to_string(layer_content, layer_rules, modified);
+    apply_rules_to_string(layer_content, layer_rules, modified, parser, in_layer);
     size_t cnt_written = ::fwrite(layer_content.data(), 1, layer_content.size(), out);
     if (::ferror(out) || cnt_written != layer_content.size())
         throw Slic3r::RuntimeError(Slic3r::format("GCode substitution failed. Error writing file."));
@@ -691,22 +1140,56 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
         return false;
 
     try {
-        // Categorize rules by block type.
+        // Categorize rules by block type and check for macros in a single pass.
         // Non-block rules (no L/C flag) are treated as layer-level rules
         // so they are applied within the layer chunk.
         // Cross layer regex is not supported.
         std::vector<GCodeSubRule*> layer_rules;  // L flag or no flag — apply per layer chunk
         std::vector<GCodeSubRule*> color_rules;  // C flag — apply per color chunk
+        bool any_macros = false;
 
         for (auto &rule : all_rules) {
             if (rule.block_type == GCodeSubBlockType::Color)
                 color_rules.push_back(&rule);
             else
                 layer_rules.push_back(&rule);
+            if (rule.macro_meta.has_macros)
+                any_macros = true;
         }
 
         if (layer_rules.empty() && color_rules.empty())
             return false;
+
+        // Create PlaceholderParser only if needed.
+        PlaceholderParser parser;
+        PlaceholderParser* parser_ptr = any_macros ? &parser : nullptr;
+
+        // Parse G-code header to extract global variables.
+        // Read just enough of the file to find the header block.
+        std::string header_content;
+        {
+            FilePtr hdr{ boost::nowide::fopen(in_path.c_str(), "rb") };
+            if (hdr.f && any_macros) {
+                char buf[4096];
+                size_t lines_read = 0;
+                const size_t max_header_lines = 200; // safety limit for malformed files
+                while (fgets(buf, sizeof(buf), hdr.f)) {
+                    header_content.append(buf);
+                    if (header_content.find("HEADER_BLOCK_END") != std::string::npos)
+                        break;
+                    if (++lines_read > max_header_lines) {
+                        BOOST_LOG_TRIVIAL(warning) << "GCode macro: HEADER_BLOCK_END not found after "
+                            << max_header_lines << " lines. Header parsing aborted.";
+                        break;
+                    }
+                }
+                // Set global variables from header.
+                auto header_vars = parse_gcode_header(header_content);
+                for (auto &[key, val] : header_vars) {
+                    parser.set(key, val);
+                }
+            }
+        }
 
         bool modified = false;
 
@@ -727,9 +1210,38 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
             std::string layer_content;  // accumulates processed color chunks (also used for preamble/suffix)
             bool in_layer = false;
 
+            // Macro scope manager — only active when macros are present.
+            int total_layers = 0;
+            if (any_macros) {
+                auto it = parser.option("total_layer_count");
+                if (it) {
+                    try {
+                        total_layers = std::stoi(it->serialize());
+                    } catch (...) {
+                        BOOST_LOG_TRIVIAL(warning) << "GCode macro: invalid total_layer_count '"
+                            << it->serialize() << "' in header. {last_layer} will always be false.";
+                    }
+                }
+            }
+            MacroScopeManager scope(parser, total_layers);
+
             std::string line;
             int layer_count = 0;
             int color_count = 0;
+            double current_layer_z = 0.0;
+            double current_layer_height = 0.0;
+            double previous_layer_z = 0.0;
+            // Track whether we've seen the Height tag for the current layer yet.
+            // The Height tag appears on a line AFTER the layer marker, not on the marker itself.
+            bool layer_z_set = false;
+            // Track whether we've skipped the first ;LAYER_CHANGE after EXECUTABLE_BLOCK_START.
+            // This first marker is part of layer 0, not a layer boundary.
+            bool skipped_first_layer_marker = false;
+            // Lookahead counter to limit parse_layer_z calls. The Height tag is
+            // practically guaranteed to be within the first few lines of a layer.
+            // After 20 lines without finding it, give up to avoid per-line overhead.
+            int height_lookahead = 0;
+            const int max_height_lookahead = 20;
             char buf[4096];
             while (fgets(buf, sizeof(buf), in.f)) {
                 line.assign(buf);
@@ -740,34 +1252,121 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                 if (!line.empty() && line.back() == '\n')
                     line.pop_back();
 
-                // ;LAYER_CHANGE
-                if (is_layer_marker(line)) {
+                // EXECUTABLE_BLOCK_START — start of first layer (layer 0).
+                // Content between EXECUTABLE_BLOCK_START and ;LAYER_CHANGE includes
+                // actual G-code that belongs to layer 0, not the preamble.
+                if (is_executable_block_start(line)) {
                     if (!in_layer) {
+                        // Preamble — enter global scope.
+                        if (any_macros) scope.enter_global();
+                        // Flush any color chunk that accumulated in the preamble.
+                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer);
                         BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing preamble (" << layer_content.size() << " bytes)";
+                        // Flush preamble to output.
+                        flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer);
+                    }
+                    // Start layer 0 with this marker.
+                    if (any_macros) {
+                        scope.enter_layer(0, 0.0, 0.0);
+                        layer_z_set = false;
+                        height_lookahead = max_height_lookahead;
+                    }
+                    in_layer = true;
+                    color_count = 0;
+                    color_chunk.append(line).push_back('\n');
+                // ;LAYER_CHANGE — layer boundary.
+                // When EXECUTABLE_BLOCK_START started layer 0, the first ;LAYER_CHANGE
+                // is skipped because the content before it belongs to layer 0.
+                // The Height tag (;Z:...) for layer 0 appears after this skipped marker.
+                } else if (is_layer_marker(line)) {
+                    if (!in_layer) {
+                        // Fallback: no EXECUTABLE_BLOCK_START found, treat first
+                        // ;LAYER_CHANGE as layer 0 start (backward compatibility).
+                        if (any_macros) scope.enter_global();
+                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer);
+                        BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing preamble (" << layer_content.size() << " bytes)";
+                        flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer);
+                        if (any_macros) {
+                            scope.enter_layer(0, 0.0, 0.0);
+                            layer_z_set = false;
+                            height_lookahead = max_height_lookahead;
+                        }
+                        in_layer = true;
+                        color_count = 0;
+                        color_chunk.append(line).push_back('\n');
+                    } else if (skipped_first_layer_marker == false && layer_count == 0) {
+                        // First ;LAYER_CHANGE after EXECUTABLE_BLOCK_START — skip it.
+                        // Layer 0's Height tag appears after this marker.
+                        // Append to current color chunk (part of layer 0).
+                        skipped_first_layer_marker = true;
+                        color_chunk.append(line).push_back('\n');
                     } else {
-                        // Subsequent layer — flush previous layer's color chunk first.
+                        // Subsequent layer — flush previous layer.
                         BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing layer " << layer_count
                             << " (layer_content=" << layer_content.size() << " bytes)";
-                        flush_color_chunk(color_chunk, color_rules, layer_content, modified);
+                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer);
+                        if (any_macros) scope.exit_color();
+                        flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer);
+                        if (any_macros) scope.exit_layer();
+                        // Start new layer.
+                        if (any_macros) {
+                            scope.enter_layer(++layer_count, 0.0, 0.0);
+                            layer_z_set = false;
+                            height_lookahead = max_height_lookahead;
+                        } else {
+                            ++layer_count;
+                        }
+                        color_count = 0;
+                        color_chunk.append(line).push_back('\n');
                     }
-                    // Flush layer content (preamble on first marker, layer on subsequent).
-                    flush_layer_chunk(layer_content, layer_rules, out.f, modified);
-                    // Start new layer with this layer marker.
-                    color_chunk.append(line).push_back('\n');
-                    in_layer = true;
-                    ++layer_count;
-                    color_count = 0;
-                // ; CP TOOLCHANGE START
-                } else if (is_color_marker(line)) {
+                // Bare T command (T0, T1, T2, ...) — tool change / color boundary
+                } else if (is_bare_t_command(line)) {
                     // Flush previous color chunk within current layer.
                     BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing color chunk " << color_count
                         << " (color_chunk=" << color_chunk.size() << " bytes)";
-                    flush_color_chunk(color_chunk, color_rules, layer_content, modified);
+                    // Flush color chunk BEFORE exiting color scope (so color-scoped vars are available).
+                    flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer);
+                    // Exit previous color scope.
+                    if (any_macros) scope.exit_color();
                     // Start new color chunk with this color marker.
+                    if (any_macros) {
+                        ++color_count;
+                        scope.enter_color(color_count, color_count);
+                    } else {
+                        ++color_count;
+                    }
                     color_chunk.append(line).push_back('\n');
-                    ++color_count;
+                // EXECUTABLE_BLOCK_END — end of last layer, start of suffix
+                } else if (is_executable_block_end(line)) {
+                    // Flush the last layer's color chunk and layer chunk.
+                    BOOST_LOG_TRIVIAL(debug) << "GCode substitution: EXECUTABLE_BLOCK_END — flushing last layer";
+                    flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer);
+                    if (any_macros) scope.exit_color();
+                    flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer);
+                    if (any_macros) scope.exit_layer();
+                    // Exit layer mode — subsequent lines are suffix.
+                    in_layer = false;
+                    // Append this line to the suffix.
+                    layer_content.append(line).push_back('\n');
                 } else {
-                    // Regular line — append to current section.
+                    // Regular line — check for Height tag before appending.
+                    // The Height tag appears right after the layer marker and carries Z position.
+                    // Limit parse_layer_z to the first max_height_lookahead lines to avoid
+                    // per-line overhead when Height tags are absent.
+                    if (any_macros && in_layer && !layer_z_set && height_lookahead > 0) {
+                        --height_lookahead;
+                        auto z = parse_layer_z(line);
+                        if (z) {
+                            current_layer_z = *z;
+                            // Compute layer_height from the difference between consecutive Z positions.
+                            current_layer_height = (layer_count == 1) ? current_layer_z : (current_layer_z - previous_layer_z);
+                            // Update the scope with the correct Z/height values.
+                            scope.update_layer_z(current_layer_z, current_layer_height);
+                            previous_layer_z = current_layer_z;
+                            layer_z_set = true;
+                        }
+                    }
+                    // Append to current section.
                     if (in_layer)
                         color_chunk.append(line).push_back('\n');
                     else
@@ -779,8 +1378,8 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
             BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing final color chunk ("
                 << color_chunk.size() << " bytes), final layer_content ("
                 << layer_content.size() << " bytes)";
-            flush_color_chunk(color_chunk, color_rules, layer_content, modified);
-            flush_layer_chunk(layer_content, layer_rules, out.f, modified);
+            flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer);
+            flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer);
 
             BOOST_LOG_TRIVIAL(debug) << "GCode substitution: processed " << layer_count
                 << " layers";

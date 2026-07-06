@@ -105,6 +105,54 @@ SCENARIO("GCode Substitution: parse_gcode_substitution_rules", "[PostProcessor]"
         }
     }
 
+    GIVEN("a rule with M flag (metadata-only)") {
+        auto config = make_config("s/old/new/M");
+        auto rules = parse_gcode_substitution_rules(config);
+        THEN("rule has metadata_only set") {
+            REQUIRE(rules[0].metadata_only == true);
+        }
+    }
+
+    GIVEN("a rule without M flag") {
+        auto config = make_config("s/old/new/");
+        auto rules = parse_gcode_substitution_rules(config);
+        THEN("rule has metadata_only false") {
+            REQUIRE(rules[0].metadata_only == false);
+        }
+    }
+
+    GIVEN("a rule with macro variable in replacement") {
+        auto config = make_config("s/old/new_{layer_num}/");
+        auto rules = parse_gcode_substitution_rules(config);
+        THEN("macro_meta.has_macros is true") {
+            REQUIRE(rules[0].macro_meta.has_macros == true);
+        }
+    }
+
+    GIVEN("a rule without macro variable in replacement") {
+        auto config = make_config("s/old/new_value/");
+        auto rules = parse_gcode_substitution_rules(config);
+        THEN("macro_meta.has_macros is false") {
+            REQUIRE(rules[0].macro_meta.has_macros == false);
+        }
+    }
+
+    GIVEN("a rule with ${1} back-reference (not a macro)") {
+        auto config = make_config("s/(A)/${1}B/");
+        auto rules = parse_gcode_substitution_rules(config);
+        THEN("macro_meta.has_macros is false for back-references") {
+            REQUIRE(rules[0].macro_meta.has_macros == false);
+        }
+    }
+
+    GIVEN("a rule with escaped brace \\{ (not a macro)") {
+        auto config = make_config("s/old/new\\{literal/");
+        auto rules = parse_gcode_substitution_rules(config);
+        THEN("macro_meta.has_macros is false for escaped braces") {
+            REQUIRE(rules[0].macro_meta.has_macros == false);
+        }
+    }
+
     GIVEN("multiple rules separated by newlines") {
         auto config = make_config("s/A/B/\ns/C/D/\nl/E/F/");
         auto rules = parse_gcode_substitution_rules(config);
@@ -204,8 +252,8 @@ SCENARIO("GCode Substitution: parse_gcode_substitution_rules", "[PostProcessor]"
 }
 
 SCENARIO("GCode Substitution: apply_gcode_substitutions — basic", "[PostProcessor]") {
-    GIVEN("simple regex replacement") {
-        std::string input = "G1 E10\nG1 E20\nG1 E30\n";
+    GIVEN("simple regex replacement in layer chunk") {
+        std::string input = ";LAYER_CHANGE\nG1 E10\nG1 E20\nG1 E30\n";
         std::string in_path = create_temp_file(input);
         std::string out_path = in_path + ".out";
 
@@ -225,8 +273,8 @@ SCENARIO("GCode Substitution: apply_gcode_substitutions — basic", "[PostProces
         std::filesystem::remove(out_path);
     }
 
-    GIVEN("literal replacement") {
-        std::string input = "G1 E10\nG1 E20\n";
+    GIVEN("literal replacement in layer chunk") {
+        std::string input = ";LAYER_CHANGE\nG1 E10\nG1 E20\n";
         std::string in_path = create_temp_file(input);
         std::string out_path = in_path + ".out";
 
@@ -245,8 +293,8 @@ SCENARIO("GCode Substitution: apply_gcode_substitutions — basic", "[PostProces
         std::filesystem::remove(out_path);
     }
 
-    GIVEN("case-insensitive regex replacement") {
-        std::string input = "G1 E10\ng1 e10\nG1 e10\n";
+    GIVEN("case-insensitive regex replacement in layer chunk") {
+        std::string input = ";LAYER_CHANGE\nG1 E10\ng1 e10\nG1 e10\n";
         std::string in_path = create_temp_file(input);
         std::string out_path = in_path + ".out";
 
@@ -267,8 +315,8 @@ SCENARIO("GCode Substitution: apply_gcode_substitutions — basic", "[PostProces
         std::filesystem::remove(out_path);
     }
 
-    GIVEN("first-only replacement") {
-        std::string input = "G1 E10\nG1 E10\nG1 E10\n";
+    GIVEN("first-only replacement in layer chunk") {
+        std::string input = ";LAYER_CHANGE\nG1 E10\nG1 E10\nG1 E10\n";
         std::string in_path = create_temp_file(input);
         std::string out_path = in_path + ".out";
 
@@ -292,8 +340,8 @@ SCENARIO("GCode Substitution: apply_gcode_substitutions — basic", "[PostProces
         std::filesystem::remove(out_path);
     }
 
-    GIVEN("capture group replacement with ${1}") {
-        std::string input = "G1 E10 F1000\n";
+    GIVEN("capture group replacement with ${1} in layer chunk") {
+        std::string input = ";LAYER_CHANGE\nG1 E10 F1000\n";
         std::string in_path = create_temp_file(input);
         std::string out_path = in_path + ".out";
 
@@ -346,9 +394,10 @@ SCENARIO("GCode Substitution: Complex \\G anchor with filament_colour_type", "[P
 
         // Rule 1: Iteratively replace ; between digits with , using \G anchor.
         // Rule 2: Remove trailing comma before non-digit.
+        // M flag needed since this is preamble (no layer markers).
         std::string subs =
-            "s/(?:(^;\\s*filament_colour_type\\s*=\\s*)|\\G\\D)(\\d+)/${1}${2},/\n"
-            "s/(^;\\s*filament_colour_type\\s*=\\s*(?:,?\\d+)+)[^\\n\\d]/${1}/";
+            "s/(?:(^;\\s*filament_colour_type\\s*=\\s*)|\\G\\D)(\\d+)/${1}${2},/M\n"
+            "s/(^;\\s*filament_colour_type\\s*=\\s*(?:,?\\d+)+)[^\\n\\d]/${1}/M";
 
         auto config = make_config(subs);
         auto rules = parse_gcode_substitution_rules(config);
@@ -380,8 +429,8 @@ SCENARIO("GCode Substitution: Complex \\G anchor with filament_colour_type", "[P
         std::string out_path = in_path + ".out";
 
         std::string subs =
-            "s/(?:(^;\\s*filament_colour_type\\s*=\\s*)|\\G\\D)(\\d+)/${1}${2},/\n"
-            "s/(^;\\s*filament_colour_type\\s*=\\s*(?:,?\\d+)+)[^\\n\\d]/${1}/";
+            "s/(?:(^;\\s*filament_colour_type\\s*=\\s*)|\\G\\D)(\\d+)/${1}${2},/M\n"
+            "s/(^;\\s*filament_colour_type\\s*=\\s*(?:,?\\d+)+)[^\\n\\d]/${1}/M";
 
         auto config = make_config(subs);
         auto rules = parse_gcode_substitution_rules(config);
@@ -400,8 +449,34 @@ SCENARIO("GCode Substitution: Complex \\G anchor with filament_colour_type", "[P
 
 SCENARIO("GCode Substitution: Chunking — no layer markers", "[PostProcessor]") {
     // When there are no LAYER_CHANGE markers, the entire file is one preamble chunk.
+    // Non-M rules do NOT match in preamble — use M flag for preamble matching.
 
-    GIVEN("file with no layer markers") {
+    GIVEN("file with no layer markers and M-flagged rule") {
+        std::string input =
+            "G28\n"
+            "G1 E10\n"
+            "G1 E20\n"
+            "G91\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/M");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+
+        THEN("M-flagged rule matches in preamble") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            REQUIRE(output.find("E100") != std::string::npos);
+            REQUIRE(output.find("E10") == std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("file with no layer markers and non-M rule should NOT match") {
         std::string input =
             "G28\n"
             "G1 E10\n"
@@ -415,11 +490,11 @@ SCENARIO("GCode Substitution: Chunking — no layer markers", "[PostProcessor]")
 
         bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
 
-        THEN("substitution is applied to the whole file") {
-            REQUIRE(modified == true);
+        THEN("non-M rule does not match in preamble") {
+            REQUIRE(modified == false);
             std::string output = read_file_content(out_path);
-            REQUIRE(output.find("E100") != std::string::npos);
-            REQUIRE(output.find("E10") == std::string::npos);
+            REQUIRE(output.find("E100") == std::string::npos);
+            REQUIRE(output.find("E10") != std::string::npos);
         }
 
         std::filesystem::remove(in_path);
@@ -486,12 +561,12 @@ SCENARIO("GCode Substitution: Chunking — rules applied per layer", "[PostProce
 }
 
 SCENARIO("GCode Substitution: Chunking — color rules isolated per color chunk", "[PostProcessor]") {
-    GIVEN("file with two color chunks and C-flag rule") {
+    GIVEN("file with two color chunks split by bare T commands and C-flag rule") {
         std::string input =
             ";LAYER_CHANGE\n"
-            "; CP TOOLCHANGE START\n"
+            "T0\n"
             "G1 E10\n"
-            "; CP TOOLCHANGE START\n"
+            "T1\n"
             "G1 E10\n";
         std::string in_path = create_temp_file(input);
         std::string out_path = in_path + ".out";
@@ -517,16 +592,15 @@ SCENARIO("GCode Substitution: Chunking — color rules isolated per color chunk"
     }
 }
 
-SCENARIO("GCode Substitution: Chunking — preamble and suffix treated as layer chunks", "[PostProcessor]") {
-    GIVEN("file with preamble, layer, and suffix") {
+SCENARIO("GCode Substitution: M flag — strict chunk type separation", "[PostProcessor]") {
+    // M-flagged rules: run ONLY on preamble/suffix (forbidden on layer/color chunks).
+    // Non-M rules: run ONLY on layer/color chunks (forbidden on preamble/suffix).
+
+    GIVEN("non-M rule should NOT match in preamble") {
         std::string input =
             "G28\n"
             "G1 E10\n"
             ";LAYER_CHANGE\n"
-            "G1 E10\n"
-            ";LAYER_CHANGE\n"
-            "G1 E10\n"
-            "G91\n"
             "G1 E10\n";
         std::string in_path = create_temp_file(input);
         std::string out_path = in_path + ".out";
@@ -536,15 +610,129 @@ SCENARIO("GCode Substitution: Chunking — preamble and suffix treated as layer 
 
         bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
 
-        THEN("all chunks including preamble and suffix are substituted") {
+        THEN("only layer chunk is substituted, preamble is not") {
             REQUIRE(modified == true);
             std::string output = read_file_content(out_path);
-            size_t count = 0, pos = 0;
-            while ((pos = output.find("E100", pos)) != std::string::npos) {
-                ++count;
-                ++pos;
-            }
-            REQUIRE(count == 4);
+            // Preamble E10 should remain unchanged.
+            REQUIRE(output.find("G28\nG1 E10\n") != std::string::npos);
+            // Layer E10 should be replaced.
+            REQUIRE(output.find("E100") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("M-flagged rule should ONLY match in preamble") {
+        std::string input =
+            "G28\n"
+            "G1 E10\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/M");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+
+        THEN("only preamble is substituted, layer is not") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            // Preamble E10 should be replaced.
+            REQUIRE(output.find("G28\nG1 E100\n") != std::string::npos);
+            // Layer E10 should remain unchanged.
+            REQUIRE(output.find(";LAYER_CHANGE\nG1 E10\n") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("M-flagged rule with EXECUTABLE_BLOCK_END should match in suffix") {
+        std::string input =
+            "G28\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n"
+            "; EXECUTABLE_BLOCK_END\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/M");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+
+        THEN("suffix is substituted, layer is not") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            // Layer E10 should remain unchanged.
+            REQUIRE(output.find(";LAYER_CHANGE\nG1 E10\n") != std::string::npos);
+            // Suffix E10 should be replaced.
+            REQUIRE(output.find("E100") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("non-M rule with EXECUTABLE_BLOCK_END should NOT match in suffix") {
+        std::string input =
+            "G28\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n"
+            "; EXECUTABLE_BLOCK_END\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+
+        THEN("layer is substituted, suffix is not") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            // Layer E10 should be replaced.
+            REQUIRE(output.find(";LAYER_CHANGE\nG1 E100\n") != std::string::npos);
+            // Suffix E10 should remain unchanged.
+            REQUIRE(output.find("; EXECUTABLE_BLOCK_END\nG1 E10\n") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("both M and non-M rules on same file") {
+        std::string input =
+            "G28\n"
+            "G1 E10\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n"
+            "; EXECUTABLE_BLOCK_END\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        // M rule replaces E10 with E200 in preamble/suffix.
+        // Non-M rule replaces E10 with E100 in layer chunks.
+        auto config = make_config("s/E10/E200/M\ns/E10/E100/");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+
+        THEN("each rule type matches only its designated chunk type") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            // Preamble: M rule applied (E10 -> E200).
+            REQUIRE(output.find("G28\nG1 E200\n") != std::string::npos);
+            // Layer: non-M rule applied (E10 -> E100).
+            REQUIRE(output.find(";LAYER_CHANGE\nG1 E100\n") != std::string::npos);
+            // Suffix: M rule applied (E10 -> E200).
+            REQUIRE(output.find("; EXECUTABLE_BLOCK_END\nG1 E200\n") != std::string::npos);
         }
 
         std::filesystem::remove(in_path);
@@ -553,7 +741,7 @@ SCENARIO("GCode Substitution: Chunking — preamble and suffix treated as layer 
 }
 
 SCENARIO("GCode Substitution: Chunking — CHANGE_LAYER also recognized", "[PostProcessor]") {
-    GIVEN("file using CHANGE_LAYER marker") {
+    GIVEN("file using CHANGE_LAYER marker (BBL variant)") {
         std::string input =
             "G28\n"
             ";CHANGE_LAYER\n"
@@ -575,12 +763,81 @@ SCENARIO("GCode Substitution: Chunking — CHANGE_LAYER also recognized", "[Post
         std::filesystem::remove(in_path);
         std::filesystem::remove(out_path);
     }
+
+    GIVEN("file using LAYER_CHANGE marker (compatible variant)") {
+        std::string input =
+            "G28\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+
+        THEN("LAYER_CHANGE is recognized as layer boundary") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            REQUIRE(output.find("E100") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("file using bare T command as color boundary") {
+        std::string input =
+            "; CHANGE_LAYER\n"
+            "T0\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/C");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+
+        THEN("bare T command is recognized as color boundary") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            REQUIRE(output.find("E100") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("file using bare T command with LAYER_CHANGE") {
+        std::string input =
+            ";LAYER_CHANGE\n"
+            "T1\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/C");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+
+        THEN("bare T command is recognized as color boundary") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            REQUIRE(output.find("E100") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
 }
 
 SCENARIO("GCode Substitution: Multiline flag (m)", "[PostProcessor]") {
-    GIVEN("multiline regex with ^ anchor") {
+    GIVEN("multiline regex with ^ anchor in layer chunk") {
         std::string input =
-            "G1 E10\nG1 E20\nG2 E30\n";
+            ";LAYER_CHANGE\nG1 E10\nG1 E20\nG2 E30\n";
         std::string in_path = create_temp_file(input);
         std::string out_path = in_path + ".out";
 
@@ -602,9 +859,9 @@ SCENARIO("GCode Substitution: Multiline flag (m)", "[PostProcessor]") {
 }
 
 SCENARIO("GCode Substitution: Match-newline flag (s)", "[PostProcessor]") {
-    GIVEN("regex with . matching newlines") {
+    GIVEN("regex with . matching newlines in layer chunk") {
         std::string input =
-            "G1 E10\nG1 E20\n";
+            ";LAYER_CHANGE\nG1 E10\nG1 E20\n";
         std::string in_path = create_temp_file(input);
         std::string out_path = in_path + ".out";
 
@@ -625,9 +882,9 @@ SCENARIO("GCode Substitution: Match-newline flag (s)", "[PostProcessor]") {
 }
 
 SCENARIO("GCode Substitution: Named capture groups", "[PostProcessor]") {
-    GIVEN("regex with named capture groups") {
+    GIVEN("regex with named capture groups in layer chunk") {
         std::string input =
-            "G1 E10 F1000\n";
+            ";LAYER_CHANGE\nG1 E10 F1000\n";
         std::string in_path = create_temp_file(input);
         std::string out_path = in_path + ".out";
 
@@ -652,9 +909,9 @@ SCENARIO("GCode Substitution: Named capture groups", "[PostProcessor]") {
 }
 
 SCENARIO("GCode Substitution: no-sub-match flag (n)", "[PostProcessor]") {
-    GIVEN("regex with n flag for performance") {
+    GIVEN("regex with n flag for performance in layer chunk") {
         std::string input =
-            "G1 E10\n";
+            ";LAYER_CHANGE\nG1 E10\n";
         std::string in_path = create_temp_file(input);
         std::string out_path = in_path + ".out";
 
@@ -705,9 +962,9 @@ SCENARIO("GCode Substitution: Comment and unknown line handling", "[PostProcesso
 }
 
 SCENARIO("GCode Substitution: run_post_process integration", "[PostProcessor]") {
-    GIVEN("post-processing with substitutions only (no scripts)") {
+    GIVEN("post-processing with substitutions only (no scripts) in layer chunk") {
         std::string input =
-            "G1 E10\nG1 E20\n";
+            ";LAYER_CHANGE\nG1 E10\nG1 E20\n";
         std::string in_path = create_temp_file(input);
         std::string output_name = in_path;
 

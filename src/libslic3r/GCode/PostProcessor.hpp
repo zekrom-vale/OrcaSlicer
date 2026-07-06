@@ -32,6 +32,13 @@ struct GCodeSubRule
     bool format_first_only = false;
     // Pre-compiled regex — set during parsing to avoid per-chunk compilation.
     std::optional<boost::regex> compiled_regex;
+    // Macro metadata — populated at parse time.
+    struct MacroMeta {
+        bool has_macros = false;  // quick check: does replacement contain {var}?
+    };
+    MacroMeta macro_meta;
+    // M flag — metadata-only mode (skip preamble/suffix, only apply within layer chunks).
+    bool metadata_only = false;
 };
 
 // Parse the raw substitution config options into a vector of GCodeSubRule.
