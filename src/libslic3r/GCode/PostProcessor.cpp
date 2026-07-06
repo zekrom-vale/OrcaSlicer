@@ -877,17 +877,17 @@ public:
     }
 
     // Enter a color block within a layer. Color vars become available.
-    void enter_color(int color_num, int tool_num)
+    void enter_color(int color_chunk_num, int tool_num)
     {
-        m_color_num = color_num;
-        m_parser.set("color_num", color_num);
+        m_color_chunk_num = color_chunk_num;
+        m_parser.set("color_chunk_num", color_chunk_num);
         m_parser.set("tool_num", tool_num);
     }
 
     // Exit a color block. Color vars are removed.
     void exit_color()
     {
-        m_parser.config_writable().erase("color_num");
+        m_parser.config_writable().erase("color_chunk_num");
         m_parser.config_writable().erase("tool_num");
     }
 
@@ -910,7 +910,7 @@ private:
     int m_total_layers;
     bool m_in_layer = false;
     int m_layer_num = 0;
-    int m_color_num = 0;
+    int m_color_chunk_num = 0;
 };
 
 // Evaluate a replacement string through PlaceholderParser with brace protection.
@@ -1030,7 +1030,7 @@ static bool apply_rule_to_string(GCodeSubRule &rule, std::string &src,
 // Apply rules to a string buffer. Updates modified flag if any rule matched.
 // M-flagged (metadata_only) rules run ONLY on preamble/suffix (in_layer=false).
 // Non-M rules run ONLY on layer/color chunks (in_layer=true).
-// When is_layer_rule is true, color-specific macros (color_num, tool_num) are
+// When is_layer_rule is true, color-specific macros (color_chunk_num, tool_num) are
 // temporarily hidden so layer rules cannot reference color variables.
 static void apply_rules_to_string(
     std::string &buf,
@@ -1046,14 +1046,14 @@ static void apply_rules_to_string(
     // When applying layer rules, temporarily hide color-specific macros.
     if (is_layer_rule) {
         auto &cfg = parser->config_writable();
-        const ConfigOption *color_num_opt = cfg.option("color_num");
+        const ConfigOption *color_chunk_num_opt = cfg.option("color_chunk_num");
         const ConfigOption *tool_num_opt = cfg.option("tool_num");
-        bool had_color_num = color_num_opt != nullptr;
+        bool had_color_chunk_num = color_chunk_num_opt != nullptr;
         bool had_tool_num = tool_num_opt != nullptr;
-        std::string color_num_val = had_color_num ? color_num_opt->serialize() : "";
+        std::string color_chunk_num_val = had_color_chunk_num ? color_chunk_num_opt->serialize() : "";
         std::string tool_num_val = had_tool_num ? tool_num_opt->serialize() : "";
-        if (had_color_num)
-            cfg.erase("color_num");
+        if (had_color_chunk_num)
+            cfg.erase("color_chunk_num");
         if (had_tool_num)
             cfg.erase("tool_num");
 
@@ -1069,8 +1069,8 @@ static void apply_rules_to_string(
         }
 
         // Restore color macros.
-        if (had_color_num)
-            parser->set("color_num", color_num_val);
+        if (had_color_chunk_num)
+            parser->set("color_chunk_num", color_chunk_num_val);
         if (had_tool_num)
             parser->set("tool_num", tool_num_val);
     }
@@ -1339,7 +1339,7 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                             << " (layer_content=" << layer_content.size() << " bytes)";
                         flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer);
                         // Don't exit_color here — the ;LAYER_CHANGE line is the first line
-                        // of the new color chunk, and color_num/tool_num should carry over
+                        // of the new color chunk, and color_chunk_num/tool_num should carry over
                         // from the previous layer until a new T command is encountered.
                         flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer);
                         if (any_macros) scope.exit_layer();

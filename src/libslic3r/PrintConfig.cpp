@@ -1049,16 +1049,16 @@ static constexpr const char* gcode_substitutions_common_doc =
 "Macros are evaluated dynamically per layer and per color block.\n\n"
 "GLOBAL VARIABLES (available everywhere):\n"
 "  {total_layer_count}    Total layer count from G-code header\n"
-"  {max_z_height}         Maximum Z height from G-code header\n"
-"  {layer_num}            Current 1-based layer index (layer-scoped)\n"
-"  {layer_z}              Current Z height (layer-scoped)\n"
-"  {layer_height}         Current layer height (layer-scoped)\n"
-"  {first_layer}          True if current layer is the first (layer-scoped)\n"
-"  {last_layer}           True if current layer is the last (layer-scoped)\n"
-"  {color_num}            Current 1-based color block index (color-scoped)\n"
-"  {tool_num}             Current tool/extruder ID (color-scoped)\n\n"
-"Layer-scoped variables are only available within layer chunks.\n"
-"Color-scoped variables are only available within color blocks.\n\n"
+"  {max_z_height}         Maximum Z height from G-code header\n\n"
+"LAYER-SCOPED VARIABLES (only in layer chunks):\n"
+"  {layer_num}            Current 0-based layer index\n"
+"  {layer_z}              Current Z height\n"
+"  {layer_height}         Current layer height\n"
+"  {first_layer}          True if current layer is the first\n"
+"  {last_layer}           True if current layer is the last\n\n"
+"COLOR-SCOPED VARIABLES (only in color blocks):\n"
+"  {color_chunk_num}      Current 1-based color chunk index\n"
+"  {tool_num}             Current tool/extruder ID\n\n"
 "Arithmetic and conditionals are supported:\n"
 "  {layer_num + 1}        Next layer number\n"
 "  {if first_layer}...{endif}  Conditional block\n\n"
@@ -1082,7 +1082,7 @@ static constexpr const char* gcode_substitutions_common_doc =
 "  s/;Z:0.2/;Z:{layer_z}/M/                     Replace with dynamic Z\n"
 "  s/;START/;LAYER {layer_num} of {total_layer_count}/M/  Progress comment\n"
 "  s/;TEMP/M104 S{nozzle_temperature}/M/         Dynamic temperature\n"
-"  s/;COLOR/;COLOR {color_num}/MC/              Insert color number";
+"  s/;COLOR/;COLOR {color_chunk_num}/MC/        Insert color chunk number";
 
 void PrintConfigDef::init_fff_params()
 {
