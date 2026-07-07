@@ -242,8 +242,8 @@ void BackgroundSlicingProcess::process_fff()
 		//BBS: add plate index into render params
 		m_temp_output_path = this->get_current_plate()->get_tmp_gcode_path();
 		m_fff_print->export_gcode(m_temp_output_path, m_gcode_result, [this](const ThumbnailsParams& params) { return this->render_thumbnails(params); });
-		if(m_fff_print->is_BBL_printer()) 
-			run_post_process(m_temp_output_path, false, "File", m_temp_output_path, m_fff_print->full_print_config());
+		if(m_fff_print->is_BBL_printer())
+			run_post_process(m_temp_output_path, false, "File", m_temp_output_path, m_fff_print);
 
 		BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": export gcode finished");
 	}
@@ -801,7 +801,7 @@ void BackgroundSlicingProcess::finalize_gcode()
 	// collide with the G-code viewer memory mapping of the unprocessed G-code. G-code viewer maps unprocessed G-code, because m_gcode_result 
 	// is calculated for the unprocessed G-code and it references lines in the memory mapped G-code file by line numbers.
 	// export_path may be changed by the post-processing script as well if the post processing script decides so, see GH #6042.
-	bool post_processed = run_post_process(output_path, true, "File", export_path, m_fff_print->full_print_config());
+	bool post_processed = run_post_process(output_path, true, "File", export_path, m_fff_print);
 	auto remove_post_processed_temp_file = [post_processed, &output_path]() {
 		if (post_processed)
 			try {
@@ -931,7 +931,7 @@ void BackgroundSlicingProcess::prepare_upload()
                 std::string source_path_str = source_path.string();
                 std::string output_name_str = m_upload_job.upload_data.upload_path.string();
                 if (run_post_process(source_path_str, false, m_upload_job.printhost->get_name(), output_name_str,
-                                    m_fff_print->full_print_config()))
+                                    m_fff_print))
                     m_upload_job.upload_data.upload_path = output_name_str;
             }
 		}

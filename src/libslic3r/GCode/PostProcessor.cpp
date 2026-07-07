@@ -6,6 +6,7 @@
 #include "libslic3r/I18N.hpp"
 #include "libslic3r/PlaceholderParser.hpp"
 #include "libslic3r/Exception.hpp"
+#include "libslic3r/Print.hpp"
 
 #include <boost/algorithm/string.hpp>
 #include <boost/log/trivial.hpp>
@@ -598,6 +599,7 @@ static std::string protect_literal_braces(const std::string& input)
     std::string result;
     result.reserve(input.size());
 
+    bool in_macro = false; // true when inside a {macro} that should be left as-is
     size_t i = 0;
     while (i < input.size()) {
         // Check for ${...} pattern — regex back-reference.
@@ -627,10 +629,11 @@ static std::string protect_literal_braces(const std::string& input)
             }
             continue;
         }
-        // '{' followed by letter/underscore — macro variable, leave as-is.
+        // '{' followed by letter/underscore — start of macro variable, leave as-is.
         if (input[i] == '{' && i + 1 < input.size()) {
             char next = input[i + 1];
             if (std::isalpha(static_cast<unsigned char>(next)) || next == '_') {
+                in_macro = true;
                 result.push_back('{');
                 ++i;
                 continue;
@@ -642,20 +645,14 @@ static std::string protect_literal_braces(const std::string& input)
             ++i;
             continue;
         }
-        // '}' preceded by letter/digit/underscore in output — end of macro variable, leave as-is.
-        // Must check output (result.back()) not input, because ${...} may have been
-        // converted to sentinels, changing what precedes the '}'.
-        if (input[i] == '}' && !result.empty()) {
-            char prev = result.back();
-            if (std::isalnum(static_cast<unsigned char>(prev)) || prev == '_') {
-                result.push_back('}');
-                ++i;
-                continue;
-            }
-        }
-        // '}' not preceded by letter/digit/underscore — literal brace, shield it.
+        // '}' — if inside a macro, it closes the macro. Otherwise it's a literal brace.
         if (input[i] == '}') {
-            result.push_back(CLOSE_BRACE_SENTINEL);
+            if (in_macro) {
+                in_macro = false;
+                result.push_back('}');
+            } else {
+                result.push_back(CLOSE_BRACE_SENTINEL);
+            }
             ++i;
             continue;
         }
@@ -691,87 +688,6 @@ static std::string restore_literal_braces(const std::string& input)
 // Returns a map of variable name → value (vectorized values stored as comma-separated strings).
 // Tolerant of spacing, order, and missing fields for compatibility flexibility.
 // Only recognized keys are extracted; unknown keys are ignored.
-static std::unordered_map<std::string, std::string> parse_gcode_header(
-    const std::string& header_content)
-{
-    std::unordered_map<std::string, std::string> vars;
-
-    // Collect lines between HEADER_BLOCK_START and HEADER_BLOCK_END.
-    // Skip CONFIG_BLOCK sections to avoid picking up gcode_substitutions
-    // values that contain {var} patterns which could be misinterpreted.
-    // The CONFIG_BLOCK ends at EXECUTABLE_BLOCK_END.
-    bool in_header = false;
-    bool in_config_block = false;
-    std::istringstream iss(header_content);
-    std::string line;
-    while (std::getline(iss, line)) {
-        // Trim whitespace.
-        boost::trim(line);
-        if (line.find("HEADER_BLOCK_START") != std::string::npos) {
-            in_header = true;
-            continue;
-        }
-        if (line.find("HEADER_BLOCK_END") != std::string::npos) {
-            in_header = false;
-            break;
-        }
-        if (!in_header)
-            continue;
-
-        // Skip CONFIG_BLOCK sections — they contain gcode_substitutions
-        // values with {var} patterns that should not be parsed as header vars.
-        if (line.find("CONFIG_BLOCK") != std::string::npos) {
-            in_config_block = true;
-            continue;
-        }
-        if (in_config_block && line.find("EXECUTABLE_BLOCK_END") != std::string::npos) {
-            in_config_block = false;
-            continue;
-        }
-        if (in_config_block)
-            continue;
-
-        // Strip leading "; " and whitespace.
-        size_t pos = 0;
-        while (pos < line.size() && (line[pos] == ';' || line[pos] == ' ' || line[pos] == '\t'))
-            ++pos;
-        if (pos >= line.size())
-            continue;
-
-        // Find the colon separator.
-        size_t colon = line.find(':', pos);
-        if (colon == std::string::npos)
-            continue;
-
-        std::string key = line.substr(pos, colon - pos);
-        std::string val = line.substr(colon + 1);
-
-        // Trim whitespace from key and value.
-        while (!key.empty() && std::isspace(static_cast<unsigned char>(key.back())))
-            key.pop_back();
-        while (!val.empty() && std::isspace(static_cast<unsigned char>(val.front())))
-            val.erase(val.begin());
-        while (!val.empty() && std::isspace(static_cast<unsigned char>(val.back())))
-            val.pop_back();
-
-        if (key.empty() || val.empty())
-            continue;
-
-        // Only extract recognized keys.
-        // Vectorized values (filament_density, filament_diameter) are stored as-is
-        // (comma-separated) and split by PlaceholderParser when indexed.
-        if (key == "total layer number")
-            vars["total_layer_count"] = val;
-        else if (key == "max_z_height")
-            vars["max_z_height"] = val;
-        else if (key == "filament_density")
-            vars["filament_density"] = val;
-        else if (key == "filament_diameter")
-            vars["filament_diameter"] = val;
-    }
-
-    return vars;
-}
 
 // Cached tag variants for layer height parsing — computed once, reused every call.
 static const std::pair<std::string_view, std::string_view> get_cached_height_tags()
@@ -1166,7 +1082,7 @@ static void flush_layer_chunk(
 // Returns true if substitutions were applied.
 // Returns false if no gcode_substitutions were defined.
 // Throws an exception on error.
-bool apply_gcode_substitutions(const std::string &in_path, const std::string &out_path, std::vector<GCodeSubRule> &&all_rules)
+bool apply_gcode_substitutions(const std::string &in_path, const std::string &out_path, std::vector<GCodeSubRule> &&all_rules, const DynamicPrintConfig &config)
 {
     if (all_rules.empty())
         return false;
@@ -1192,36 +1108,13 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
         if (layer_rules.empty() && color_rules.empty())
             return false;
 
-        // Create PlaceholderParser only if needed.
-        PlaceholderParser parser;
+        // Create PlaceholderParser with the print config as external config.
+        // This gives macros access to all print/filament/printer config variables
+        // (nozzle_temperature, filament_type, total_layer_count, max_z_height,
+        // filament_density, filament_diameter, etc.) without needing to extract
+        // them from the G-code header.
+        PlaceholderParser parser(&config);
         PlaceholderParser* parser_ptr = any_macros ? &parser : nullptr;
-
-        // Parse G-code header to extract global variables.
-        // Read just enough of the file to find the header block.
-        std::string header_content;
-        {
-            FilePtr hdr{ boost::nowide::fopen(in_path.c_str(), "rb") };
-            if (hdr.f && any_macros) {
-                char buf[4096];
-                size_t lines_read = 0;
-                const size_t max_header_lines = 200; // safety limit for malformed files
-                while (fgets(buf, sizeof(buf), hdr.f)) {
-                    header_content.append(buf);
-                    if (header_content.find("HEADER_BLOCK_END") != std::string::npos)
-                        break;
-                    if (++lines_read > max_header_lines) {
-                        BOOST_LOG_TRIVIAL(warning) << "GCode macro: HEADER_BLOCK_END not found after "
-                            << max_header_lines << " lines. Header parsing aborted.";
-                        break;
-                    }
-                }
-                // Set global variables from header.
-                auto header_vars = parse_gcode_header(header_content);
-                for (auto &[key, val] : header_vars) {
-                    parser.set(key, val);
-                }
-            }
-        }
 
         bool modified = false;
 
@@ -1251,7 +1144,7 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                         total_layers = std::stoi(it->serialize());
                     } catch (...) {
                         BOOST_LOG_TRIVIAL(warning) << "GCode macro: invalid total_layer_count '"
-                            << it->serialize() << "' in header. {last_layer} will always be false.";
+                            << it->serialize() << "'. {last_layer} will always be false.";
                     }
                 }
             }
@@ -1449,26 +1342,38 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
 //
 // If make_copy and either feature is active, creates a .pp copy to protect
 // the memory-mapped previewer handle. Returns true if any post-processing
-// work was done (caller must delete the .pp temp file when make_copy=true).
-bool run_post_process(std::string &src_path, bool make_copy, const std::string &host, std::string &output_name, const DynamicPrintConfig &config)
+// Internal: core post-processing logic using enriched config.
+static bool run_post_process_impl(std::string &src_path, bool make_copy, const std::string &host,
+    std::string &output_name, const DynamicPrintConfig &enriched_config)
 {
-    const auto *post_process = config.opt<ConfigOptionStrings>("post_process");
+    const auto *post_process = enriched_config.opt<ConfigOptionStrings>("post_process");
+
+    // Check for _DEBUG_MACRO master key — if gcode_substitutions contains only
+    // "_DEBUG_MACRO" (with optional whitespace), trigger debug mode instead.
+    const auto *print_subs = enriched_config.option<ConfigOptionString>("gcode_substitutions");
+    bool debug_macro = false;
+    if (print_subs) {
+        std::string trimmed = print_subs->value;
+        boost::trim(trimmed);
+        debug_macro = (trimmed == "_DEBUG_MACRO");
+    }
 
     // Parse all substitution rules — applied via chunked post-processing.
-    auto sub_rules = parse_gcode_substitution_rules(config);
+    auto sub_rules = parse_gcode_substitution_rules(enriched_config);
     bool has_scripts = post_process != nullptr && !post_process->values.empty();
     // Capture emptiness before std::move(sub_rules) invalidates the vector.
     bool had_sub_rules = !sub_rules.empty();
 
-    if (!had_sub_rules && !has_scripts)
+    if (!had_sub_rules && !has_scripts && !debug_macro)
         return false;
 
     BOOST_LOG_TRIVIAL(debug) << "run_post_process: make_copy=" << make_copy
         << " sub_rules_count=" << sub_rules.size()
-        << " has_scripts=" << has_scripts;
+        << " has_scripts=" << has_scripts
+        << " debug_macro=" << debug_macro;
 
     // Determine output path: .pp for isolated copy (make_copy), original for in-place.
-    std::string tmp_path = make_copy || had_sub_rules ? (src_path + ".pp") : src_path;
+    std::string tmp_path = make_copy || had_sub_rules || debug_macro ? (src_path + ".pp") : src_path;
 
     try {
         // Remove stale temp file if it exists.
@@ -1482,7 +1387,57 @@ bool run_post_process(std::string &src_path, bool make_copy, const std::string &
         // --- Step 1: Apply substitutions ---
         if (had_sub_rules) {
             // Read from original, write directly to tmp_path — no intermediate copy.
-            apply_gcode_substitutions(src_path, tmp_path, std::move(sub_rules));
+            apply_gcode_substitutions(src_path, tmp_path, std::move(sub_rules), enriched_config);
+        }
+        // --- Step 1b: Debug macro — prepend resolved macro values as comments ---
+        else if (debug_macro) {
+            // Copy source to tmp_path first.
+            std::string error_message;
+            if (copy_file(src_path, tmp_path, error_message, false) != SUCCESS)
+                throw Slic3r::RuntimeError(Slic3r::format("Failed copying G-code file %1%: %2%", src_path, error_message));
+
+            // Resolve all config keys and prepend as comments.
+            PlaceholderParser parser(&enriched_config);
+            std::string debug_header = "G4 P0 ; DEBUG_MACRO: resolved macro values\n";
+            for (const auto &key : enriched_config.keys()) {
+                std::string macro = "{" + key + "}";
+                try {
+                    std::string resolved = parser.process(macro);
+                    debug_header += "G4 P0 ; DEBUG_MACRO: " + key + " = " + resolved + "\n";
+                } catch (...) {
+                    debug_header += "G4 P0 ; DEBUG_MACRO: " + key + " = <error>\n";
+                }
+            }
+            debug_header += "G4 P0 ; DEBUG_MACRO: end\n";
+
+            // Prepend debug header using streaming — write header to a new temp file,
+            // then stream the original file content using a small fixed-size buffer to
+            // avoid loading the entire G-code file into memory.
+            {
+                std::string streaming_tmp = tmp_path + ".debug_tmp";
+                {
+                    // Open original file for reading.
+                    FilePtr fin{ boost::nowide::fopen(tmp_path.c_str(), "rb") };
+                    // Open new file for writing.
+                    FilePtr fout{ boost::nowide::fopen(streaming_tmp.c_str(), "wb") };
+                    if (fin.f && fout.f) {
+                        // Write debug header first.
+                        fwrite(debug_header.data(), 1, debug_header.size(), fout.f);
+                        // Stream file content with a small fixed-size buffer.
+                        char buffer[4096];
+                        size_t bytes_read;
+                        while ((bytes_read = fread(buffer, 1, sizeof(buffer), fin.f)) > 0) {
+                            fwrite(buffer, 1, bytes_read, fout.f);
+                        }
+                    }
+                }
+                // Replace original with the new file containing the header.
+                boost::filesystem::remove(tmp_path);
+                boost::filesystem::rename(streaming_tmp, tmp_path);
+            }
+
+            BOOST_LOG_TRIVIAL(info) << "GCode substitution: prepended DEBUG_MACRO header with "
+                << enriched_config.keys().size() << " resolved variables";
         }
         // --- Step 2: If no rules but isolation needed, make a plain copy ---
         else if (make_copy) {
@@ -1494,7 +1449,7 @@ bool run_post_process(std::string &src_path, bool make_copy, const std::string &
 
         // --- Step 3: Run post-processing scripts ---
         if (has_scripts) {
-            run_post_process_scripts(tmp_path, host, output_name, config);
+            run_post_process_scripts(tmp_path, host, output_name, enriched_config);
         }
 
         // --- Step 4: Finalize ---
@@ -1502,13 +1457,13 @@ bool run_post_process(std::string &src_path, bool make_copy, const std::string &
             // In-place: move the src path
             src_path = std::move(tmp_path);
         }
-        else if (had_sub_rules) {
+        else if (had_sub_rules || debug_macro) {
             // In-place: rename .tmp over original.
             boost::filesystem::rename(tmp_path, src_path);
         }
     } catch (...) {
         // Clean up temp file on error.
-        if (had_sub_rules || make_copy) {
+        if (had_sub_rules || debug_macro || make_copy) {
             try {
                 if (boost::filesystem::exists(tmp_path))
                     boost::filesystem::remove(tmp_path);
@@ -1520,6 +1475,25 @@ bool run_post_process(std::string &src_path, bool make_copy, const std::string &
     }
 
     return true;
+}
+
+// work was done (caller must delete the .pp temp file when make_copy=true).
+bool run_post_process(std::string &src_path, bool make_copy, const std::string &host, std::string &output_name, const Print *print)
+{
+    // Build enriched config from Print: merge full_print_config() with
+    // PrintStatistics::config() so all runtime variables (initial_extruder,
+    // print_time, used_filament, total_toolchanges, etc.) are available to
+    // PlaceholderParser macros and exported as environment variables via setenv_().
+    DynamicPrintConfig enriched_config = print->full_print_config();
+    enriched_config += print->print_statistics().config();
+    return run_post_process_impl(src_path, make_copy, host, output_name, enriched_config);
+}
+
+// Overload for backwards compatibility — takes config directly (no runtime
+// variables from PrintStatistics).
+bool run_post_process(std::string &src_path, bool make_copy, const std::string &host, std::string &output_name, const DynamicPrintConfig &config)
+{
+    return run_post_process_impl(src_path, make_copy, host, output_name, config);
 }
 
 

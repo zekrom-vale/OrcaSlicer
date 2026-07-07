@@ -260,7 +260,7 @@ SCENARIO("GCode Substitution: apply_gcode_substitutions — basic", "[PostProces
         auto config = make_config("s/E10/E100/");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("substitution was applied") {
             REQUIRE(modified == true);
@@ -281,7 +281,7 @@ SCENARIO("GCode Substitution: apply_gcode_substitutions — basic", "[PostProces
         auto config = make_config("l/E10/E100/");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("literal substitution was applied") {
             REQUIRE(modified == true);
@@ -301,7 +301,7 @@ SCENARIO("GCode Substitution: apply_gcode_substitutions — basic", "[PostProces
         auto config = make_config("s/e10/E100/i");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("all case variations are replaced") {
             REQUIRE(modified == true);
@@ -323,7 +323,7 @@ SCENARIO("GCode Substitution: apply_gcode_substitutions — basic", "[PostProces
         auto config = make_config("s/E10/E100/f");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("only first match is replaced") {
             REQUIRE(modified == true);
@@ -348,7 +348,7 @@ SCENARIO("GCode Substitution: apply_gcode_substitutions — basic", "[PostProces
         auto config = make_config("s/(E[0-9]+) (F[0-9]+)/${2} ${1}/");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("capture groups are swapped") {
             REQUIRE(modified == true);
@@ -368,7 +368,7 @@ SCENARIO("GCode Substitution: apply_gcode_substitutions — basic", "[PostProces
         DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("no substitution is applied") {
             REQUIRE(modified == false);
@@ -406,7 +406,7 @@ SCENARIO("GCode Substitution: Complex \\G anchor with filament_colour_type", "[P
             REQUIRE(rules.size() == 2);
         }
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("semicolons are replaced with commas") {
             REQUIRE(modified == true);
@@ -435,7 +435,7 @@ SCENARIO("GCode Substitution: Complex \\G anchor with filament_colour_type", "[P
         auto config = make_config(subs);
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("single value is handled correctly") {
             std::string output = read_file_content(out_path);
@@ -463,7 +463,7 @@ SCENARIO("GCode Substitution: Chunking — no layer markers", "[PostProcessor]")
         auto config = make_config("s/E10/E100/M");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("M-flagged rule matches in preamble") {
             REQUIRE(modified == true);
@@ -488,7 +488,7 @@ SCENARIO("GCode Substitution: Chunking — no layer markers", "[PostProcessor]")
         auto config = make_config("s/E10/E100/");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("non-M rule does not match in preamble") {
             REQUIRE(modified == false);
@@ -516,7 +516,7 @@ SCENARIO("GCode Substitution: Chunking — rules applied per layer", "[PostProce
         auto config = make_config("s/E10/E100/");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("both layers are substituted") {
             REQUIRE(modified == true);
@@ -546,7 +546,7 @@ SCENARIO("GCode Substitution: Chunking — rules applied per layer", "[PostProce
         auto config = make_config("s/E10/E100/");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("only first layer is substituted") {
             REQUIRE(modified == true);
@@ -574,7 +574,7 @@ SCENARIO("GCode Substitution: Chunking — color rules isolated per color chunk"
         auto config = make_config("s/E10/E100/C");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("both color chunks are substituted") {
             REQUIRE(modified == true);
@@ -608,7 +608,7 @@ SCENARIO("GCode Substitution: M flag — strict chunk type separation", "[PostPr
         auto config = make_config("s/E10/E100/");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("only layer chunk is substituted, preamble is not") {
             REQUIRE(modified == true);
@@ -635,7 +635,7 @@ SCENARIO("GCode Substitution: M flag — strict chunk type separation", "[PostPr
         auto config = make_config("s/E10/E100/M");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("only preamble is substituted, layer is not") {
             REQUIRE(modified == true);
@@ -663,7 +663,7 @@ SCENARIO("GCode Substitution: M flag — strict chunk type separation", "[PostPr
         auto config = make_config("s/E10/E100/M");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("suffix is substituted, layer is not") {
             REQUIRE(modified == true);
@@ -691,7 +691,7 @@ SCENARIO("GCode Substitution: M flag — strict chunk type separation", "[PostPr
         auto config = make_config("s/E10/E100/");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("layer is substituted, suffix is not") {
             REQUIRE(modified == true);
@@ -722,7 +722,7 @@ SCENARIO("GCode Substitution: M flag — strict chunk type separation", "[PostPr
         auto config = make_config("s/E10/E200/M\ns/E10/E100/");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("each rule type matches only its designated chunk type") {
             REQUIRE(modified == true);
@@ -752,7 +752,7 @@ SCENARIO("GCode Substitution: Chunking — CHANGE_LAYER also recognized", "[Post
         auto config = make_config("s/E10/E100/");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("CHANGE_LAYER is recognized as layer boundary") {
             REQUIRE(modified == true);
@@ -775,7 +775,7 @@ SCENARIO("GCode Substitution: Chunking — CHANGE_LAYER also recognized", "[Post
         auto config = make_config("s/E10/E100/");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("LAYER_CHANGE is recognized as layer boundary") {
             REQUIRE(modified == true);
@@ -798,7 +798,7 @@ SCENARIO("GCode Substitution: Chunking — CHANGE_LAYER also recognized", "[Post
         auto config = make_config("s/E10/E100/C");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("bare T command is recognized as color boundary") {
             REQUIRE(modified == true);
@@ -821,7 +821,7 @@ SCENARIO("GCode Substitution: Chunking — CHANGE_LAYER also recognized", "[Post
         auto config = make_config("s/E10/E100/C");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("bare T command is recognized as color boundary") {
             REQUIRE(modified == true);
@@ -844,7 +844,7 @@ SCENARIO("GCode Substitution: Multiline flag (m)", "[PostProcessor]") {
         auto config = make_config("s/^G1 E10/REPLACED/m");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("only lines starting with G1 E10 are replaced") {
             REQUIRE(modified == true);
@@ -868,7 +868,7 @@ SCENARIO("GCode Substitution: Match-newline flag (s)", "[PostProcessor]") {
         auto config = make_config("s/G1 E10.*/REPLACED/s");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("dot matches across newlines") {
             REQUIRE(modified == true);
@@ -895,7 +895,7 @@ SCENARIO("GCode Substitution: Named capture groups", "[PostProcessor]") {
             REQUIRE(rules.size() == 1);
         }
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("named captures work in replacement") {
             REQUIRE(modified == true);
@@ -918,7 +918,7 @@ SCENARIO("GCode Substitution: no-sub-match flag (n)", "[PostProcessor]") {
         auto config = make_config("s/E10/E100/n");
         auto rules = parse_gcode_substitution_rules(config);
 
-        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules));
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
 
         THEN("substitution works without sub-match overhead") {
             REQUIRE(modified == true);
