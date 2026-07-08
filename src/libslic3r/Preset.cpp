@@ -1847,6 +1847,25 @@ int PresetCollection::get_differed_values_to_update(Preset& preset, std::map<std
     return 0;
 }
 
+// Security: strip dangerous regex G-code substitution keys from configs loaded from
+// untrusted .3mf project files to prevent arbitrary command injection via embedded
+// printer/process/filament presets.
+void PresetCollection::sanitize_imported_project_config(DynamicPrintConfig& config)
+{
+    static const std::array<const char*, 2> kBlacklistedKeys = {
+        "gcode_substitutions",
+        "printer_gcode_substitutions",
+    };
+
+    for (const char* key : kBlacklistedKeys) {
+        if (config.has(key)) {
+            config.erase(key);
+            BOOST_LOG_TRIVIAL(warning) << "Dropped unverified G-code substitution key \"" << key
+                                       << "\" from untrusted .3mf project preset.";
+        }
+    }
+}
+
 //BBS: save user presets to local
 void PresetCollection::load_project_embedded_presets(std::vector<Preset*>& project_presets, const std::string& type, PresetsConfigSubstitutions& substitutions, ForwardCompatibilitySubstitutionRule rule)
 {
@@ -1873,6 +1892,9 @@ void PresetCollection::load_project_embedded_presets(std::vector<Preset*>& proje
         }
         try {
             DynamicPrintConfig config = preset->config;
+            // Security: strip dangerous regex G-code substitution keys from embedded
+            // 3MF presets to prevent arbitrary command injection.
+            sanitize_imported_project_config(config);
             if (preset->loading_substitutions && ! preset->loading_substitutions->empty()) {
                 substitutions.push_back({ preset->name, m_type, PresetConfigSubstitutions::Source::ProjectFile, preset->name, std::move(*(preset->loading_substitutions))});
                 free(preset->loading_substitutions);

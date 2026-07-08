@@ -386,6 +386,26 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
                 bool has_M = flags.find('M') != std::string::npos;
                 rule.metadata_only = has_M;
 
+                // Reject conflicting section mode flags: M (metadata), C (color block),
+                // P (pending) are mutually exclusive.  Combining any two or more produces
+                // dead or confusing rules and is a silent footgun.
+                {
+                    static const std::string section_mode_flags = "MCP";
+                    int section_mode_count = 0;
+                    std::string present_modes;
+                    for (char fm : section_mode_flags) {
+                        if (flags.find(fm) != std::string::npos) {
+                            ++section_mode_count;
+                            present_modes.push_back(fm);
+                        }
+                    }
+                    if (section_mode_count > 1) {
+                        throw Slic3r::RuntimeError(Slic3r::format(
+                            "GCode substitution failed. Conflicting section mode flags "
+                            "%1% in rule: %2%", present_modes, line));
+                    }
+                }
+
                 // Warn on unknown flags — known flags: i, n, c, m, s, f, x, C, M.
                 for (char fc : flags) {
                     if (fc != 'i' && fc != 'n' && fc != 'c' && fc != 'm' &&

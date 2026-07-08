@@ -527,6 +527,11 @@ public:
     std::vector<Preset*> get_project_embedded_presets();
     bool reset_project_embedded_presets();
 
+    // Security: strip dangerous regex G-code substitution keys from configs loaded from
+    // untrusted .3mf project files to prevent arbitrary command injection via embedded
+    // printer/process/filament presets.
+    static void sanitize_imported_project_config(DynamicPrintConfig& config);
+
     // Load a preset from an already parsed config file, insert it into the sorted sequence of presets
     // and select it, losing previous modifications.
     Preset&         load_preset(const std::string &path, const std::string &name, const DynamicPrintConfig &config, bool select = true, Semver file_version = Semver());
