@@ -386,10 +386,10 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
                 bool has_M = flags.find('M') != std::string::npos;
                 rule.metadata_only = has_M;
 
-                // Warn on unknown flags — known flags: i, n, c, m, s, f, C, M.
+                // Warn on unknown flags — known flags: i, n, c, m, s, f, x, C, M.
                 for (char fc : flags) {
                     if (fc != 'i' && fc != 'n' && fc != 'c' && fc != 'm' &&
-                        fc != 's' && fc != 'f' && fc != 'C' && fc != 'M') {
+                        fc != 's' && fc != 'f' && fc != 'x' && fc != 'C' && fc != 'M') {
                         BOOST_LOG_TRIVIAL(warning) << "GCode substitution: unknown flag '" << fc
                             << "' in rule: " << line;
                     }
@@ -471,6 +471,7 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
                 bool match_newline     = flags.find('s') != std::string::npos;
                 bool format_first_only = flags.find('f') != std::string::npos;
                 bool has_m_flag        = flags.find('m') != std::string::npos;
+                bool has_x_flag        = flags.find('x') != std::string::npos;
 
                 // case_insensitive is needed at runtime for literal substitution.
                 rule.case_insensitive  = case_insensitive;
@@ -479,9 +480,15 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
                 // Pre-compile regex at parse time to avoid per-chunk compilation.
                 if (rule.is_regex) {
                     std::string pattern = rule.find;
-                    if (match_newline)  pattern = "(?s)" + pattern;
-                    if (has_m_flag)     pattern = "(?m)" + pattern;
                     boost::regex::flag_type syntax_flags = boost::regex::normal;
+                    // By default, ^ and $ should only match at chunk boundaries,
+                    // not at every line boundary. Use no_mod_m for this. The m flag
+                    // in the rule syntax overrides this to restore line-boundary
+                    // matching for ^ and $.
+                    if (!has_m_flag)    syntax_flags   |= boost::regex_constants::no_mod_m;
+                    if (match_newline)  syntax_flags   |= boost::regex_constants::mod_s;
+                    else                syntax_flags   |= boost::regex_constants::no_mod_s;
+                    if (has_x_flag)  syntax_flags      |= boost::regex_constants::mod_x;
                     if (case_insensitive) syntax_flags |= boost::regex_constants::icase;
                     if (no_sub_match)     syntax_flags |= boost::regex_constants::nosubs;
                     if (collate)          syntax_flags |= boost::regex_constants::collate;
@@ -765,8 +772,11 @@ static std::optional<double> parse_layer_z(const std::string& line)
 class MacroScopeManager
 {
 public:
-    MacroScopeManager(PlaceholderParser& parser, int total_layers)
-        : m_parser(parser), m_total_layers(total_layers) {}
+    MacroScopeManager(PlaceholderParser& parser)
+        : m_parser(parser) {}
+
+    // Set total layers after HEADER_BLOCK parsing.
+    void set_total_layers(int total) { m_total_layers = total; }
 
     // Enter preamble or suffix (global scope — no layer/color vars).
     void enter_global() { m_in_layer = false; }
@@ -793,18 +803,22 @@ public:
     }
 
     // Enter a color block within a layer. Color vars become available.
-    void enter_color(int color_chunk_num, int tool_num)
+    void enter_color(int color_chunk_num, int current_extruder)
     {
         m_color_chunk_num = color_chunk_num;
+        m_current_extruder = current_extruder;
         m_parser.set("color_chunk_num", color_chunk_num);
-        m_parser.set("tool_num", tool_num);
+        m_parser.set("current_extruder", current_extruder);
     }
+
+    // Get the current extruder id for passing to PlaceholderParser::process().
+    int current_extruder() const { return m_current_extruder; }
 
     // Exit a color block. Color vars are removed.
     void exit_color()
     {
         m_parser.config_writable().erase("color_chunk_num");
-        m_parser.config_writable().erase("tool_num");
+        m_parser.config_writable().erase("current_extruder");
     }
 
     // Exit a layer chunk. Layer vars are removed.
@@ -821,12 +835,13 @@ public:
     // Check if we are currently inside a layer chunk.
     bool in_layer() const { return m_in_layer; }
 
-private:
-    PlaceholderParser& m_parser;
-    int m_total_layers;
-    bool m_in_layer = false;
-    int m_layer_num = 0;
-    int m_color_chunk_num = 0;
+    private:
+        PlaceholderParser& m_parser;
+        int m_total_layers = 0;  // default: no layers known until HEADER_BLOCK or config lookup
+        bool m_in_layer = false;
+        int m_layer_num = 0;
+        int m_color_chunk_num = 0;
+        int m_current_extruder = 0;  // tracked extruder for PlaceholderParser::process()
 };
 
 // Evaluate a replacement string through PlaceholderParser with brace protection.
@@ -834,7 +849,8 @@ private:
 // unresolved replacement (graceful degradation).
 static std::string evaluate_replacement(
     const std::string& raw_replacement,
-    PlaceholderParser& parser)
+    PlaceholderParser& parser,
+    int current_extruder_id)
 {
     // Protect literal braces (two-phase: shield regex syntax first, then generic).
     std::string protected_replacement = protect_literal_braces(raw_replacement);
@@ -842,7 +858,9 @@ static std::string evaluate_replacement(
     // Evaluate through PlaceholderParser.
     std::string resolved;
     try {
-        resolved = parser.process(protected_replacement, 0);
+        // Pass the actual extruder ID so PlaceholderParser's internal context
+        // uses the correct tool for resolving {filament_colour_type[current_extruder]} etc.
+        resolved = parser.process(protected_replacement, current_extruder_id);
     } catch (const Slic3r::PlaceholderParserError& e) {
         // Graceful degradation — log warning, return original replacement unresolved.
         BOOST_LOG_TRIVIAL(warning) << "GCode macro evaluation failed: " << e.what()
@@ -902,6 +920,18 @@ static bool is_bare_t_command(const std::string& line)
         std::isdigit(static_cast<unsigned char>(line[pos + 1]));
 }
 
+// Detect "; CP TOOLCHANGE START" — primary tool boundary for wipe tower / multi-color.
+static bool is_toolchange_start(const std::string& line)
+{
+    return line.find("CP TOOLCHANGE START") != std::string::npos;
+}
+
+// Detect "; CP TOOLCHANGE END" — end of wipe tower toolchange sequence.
+static bool is_toolchange_end(const std::string& line)
+{
+    return line.find("CP TOOLCHANGE END") != std::string::npos;
+}
+
 // Detect the EXECUTABLE_BLOCK_START marker — separates preamble from first layer.
 static bool is_executable_block_start(const std::string& line)
 {
@@ -921,11 +951,11 @@ static bool is_executable_block_end(const std::string& line)
 // and NOT escaped, allowing user control over replacement formatting.
 // Returns true if the string was modified.
 static bool apply_rule_to_string(GCodeSubRule &rule, std::string &src,
-    PlaceholderParser* parser)
+    PlaceholderParser* parser, int current_extruder_id)
 {
     // If rule has macros and parser is available, evaluate replacement lazily.
     if (rule.macro_meta.has_macros && parser) {
-        std::string resolved = evaluate_replacement(rule.replace, *parser);
+        std::string resolved = evaluate_replacement(rule.replace, *parser, current_extruder_id);
         // Swap replacement temporarily. String move is O(1) — no allocation.
         // Wrap in try/catch to guarantee restoration if apply_substitution_rule throws.
         std::string tmp = std::move(rule.replace);
@@ -946,7 +976,7 @@ static bool apply_rule_to_string(GCodeSubRule &rule, std::string &src,
 // Apply rules to a string buffer. Updates modified flag if any rule matched.
 // M-flagged (metadata_only) rules run ONLY on preamble/suffix (in_layer=false).
 // Non-M rules run ONLY on layer/color chunks (in_layer=true).
-// When is_layer_rule is true, color-specific macros (color_chunk_num, tool_num) are
+// When is_layer_rule is true, color-specific macros (color_chunk_num, current_extruder) are
 // temporarily hidden so layer rules cannot reference color variables.
 static void apply_rules_to_string(
     std::string &buf,
@@ -954,7 +984,8 @@ static void apply_rules_to_string(
     bool &modified,
     PlaceholderParser* parser,
     bool in_layer,
-    bool is_layer_rule)
+    bool is_layer_rule,
+    int current_extruder_id)
 {
     if (buf.empty() || rules.empty())
         return;
@@ -963,15 +994,18 @@ static void apply_rules_to_string(
     if (is_layer_rule) {
         auto &cfg = parser->config_writable();
         const ConfigOption *color_chunk_num_opt = cfg.option("color_chunk_num");
-        const ConfigOption *tool_num_opt = cfg.option("tool_num");
+        const ConfigOption *current_extruder_opt = cfg.option("current_extruder");
         bool had_color_chunk_num = color_chunk_num_opt != nullptr;
-        bool had_tool_num = tool_num_opt != nullptr;
-        std::string color_chunk_num_val = had_color_chunk_num ? color_chunk_num_opt->serialize() : "";
-        std::string tool_num_val = had_tool_num ? tool_num_opt->serialize() : "";
+        bool had_current_extruder = current_extruder_opt != nullptr;
+        // Preserve integer types — serialize() converts to string, which would
+        // cause current_extruder to become ConfigOptionString on restore,
+        // breaking array index evaluation in PlaceholderParser.
+        int color_chunk_num_val = had_color_chunk_num ? color_chunk_num_opt->getInt() : 0;
+        int current_extruder_val = had_current_extruder ? current_extruder_opt->getInt() : 0;
         if (had_color_chunk_num)
             cfg.erase("color_chunk_num");
-        if (had_tool_num)
-            cfg.erase("tool_num");
+        if (had_current_extruder)
+            cfg.erase("current_extruder");
 
         for (auto *rule : rules) {
             // M-flagged rules: run ONLY on preamble/suffix (skip when in a layer).
@@ -980,15 +1014,15 @@ static void apply_rules_to_string(
             // Non-M rules: run ONLY on layer/color chunks (skip preamble/suffix).
             if (!rule->metadata_only && !in_layer)
                 continue;
-            if (apply_rule_to_string(*rule, buf, parser))
+            if (apply_rule_to_string(*rule, buf, parser, current_extruder_id))
                 modified = true;
         }
 
-        // Restore color macros.
+        // Restore color macros with correct integer types.
         if (had_color_chunk_num)
             parser->set("color_chunk_num", color_chunk_num_val);
-        if (had_tool_num)
-            parser->set("tool_num", tool_num_val);
+        if (had_current_extruder)
+            parser->set("current_extruder", current_extruder_val);
     }
     else {
         for (auto *rule : rules) {
@@ -998,7 +1032,7 @@ static void apply_rules_to_string(
             // Non-M rules: run ONLY on layer/color chunks (skip preamble/suffix).
             if (!rule->metadata_only && !in_layer)
                 continue;
-            if (apply_rule_to_string(*rule, buf, parser))
+            if (apply_rule_to_string(*rule, buf, parser, current_extruder_id))
                 modified = true;
         }
     }
@@ -1013,12 +1047,13 @@ static void flush_color_chunk(
     std::string &dest,
     bool &modified,
     PlaceholderParser* parser,
-    bool in_layer)
+    bool in_layer,
+    int current_extruder_id)
 {
     if (color_chunk.empty())
         return;
 
-    apply_rules_to_string(color_chunk, color_rules, modified, parser, in_layer, false);
+    apply_rules_to_string(color_chunk, color_rules, modified, parser, in_layer, false, current_extruder_id);
     dest.append(color_chunk);
     color_chunk.clear();
 }
@@ -1031,12 +1066,13 @@ static void flush_layer_chunk(
     FILE *out,
     bool &modified,
     PlaceholderParser* parser,
-    bool in_layer)
+    bool in_layer,
+    int current_extruder_id)
 {
     if (layer_content.empty())
         return;
 
-    apply_rules_to_string(layer_content, layer_rules, modified, parser, in_layer, true);
+    apply_rules_to_string(layer_content, layer_rules, modified, parser, in_layer, true, current_extruder_id);
     size_t cnt_written = ::fwrite(layer_content.data(), 1, layer_content.size(), out);
     if (::ferror(out) || cnt_written != layer_content.size())
         throw Slic3r::RuntimeError(Slic3r::format("GCode substitution failed. Error writing file."));
@@ -1135,20 +1171,14 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
             std::string layer_content;  // accumulates processed color chunks (also used for preamble/suffix)
             bool in_layer = false;
 
-            // Macro scope manager — only active when macros are present.
+            // Dynamically calculated values from the G-code HEADER_BLOCK.
+            // These are not static config variables — they are computed by the
+            // slicer engine based on geometry and layer heights.
             int total_layers = 0;
-            if (any_macros) {
-                auto it = parser.option("total_layer_count");
-                if (it) {
-                    try {
-                        total_layers = std::stoi(it->serialize());
-                    } catch (...) {
-                        BOOST_LOG_TRIVIAL(warning) << "GCode macro: invalid total_layer_count '"
-                            << it->serialize() << "'. {last_layer} will always be false.";
-                    }
-                }
-            }
-            MacroScopeManager scope(parser, total_layers);
+            bool in_header_block = false;
+
+            // Macro scope manager — updated after HEADER_BLOCK parsing.
+            MacroScopeManager scope(parser);
 
             std::string line;
             int layer_count = 0;
@@ -1161,6 +1191,12 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
             // Track whether we've skipped the first ;LAYER_CHANGE after EXECUTABLE_BLOCK_START.
             // This first marker is part of layer 0, not a layer boundary.
             bool skipped_first_layer_marker = false;
+            // Track whether we are inside a wipe-tower toolchange sequence.
+            // When true, bare T commands are NOT treated as chunk boundaries —
+            // the entire ; CP TOOLCHANGE START ... ; CP TOOLCHANGE END block
+            // stays in a single color chunk so color substitution rules apply
+            // to the full unload/T/load/wipe sequence.
+            bool in_toolchange_sequence = false;
             // Lookahead counter to limit parse_layer_z calls. The Height tag is
             // practically guaranteed to be within the first few lines of a layer.
             // After 20 lines without finding it, give up to avoid per-line overhead.
@@ -1176,18 +1212,116 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                 if (!line.empty() && line.back() == '\n')
                     line.pop_back();
 
+                // ---- HEADER_BLOCK parsing (preamble phase only) ----
+                // Parse key: value pairs from the HEADER_BLOCK before
+                // EXECUTABLE_BLOCK_START. These are dynamically calculated by
+                // the slicer (total_layer_number, max_z_height, etc.) and are
+                // not available as static config variables.
+                // Format: "; key: value" where value may be comma-delimited array.
+                if (!in_layer && any_macros) {
+                    if (line.find("HEADER_BLOCK_START") != std::string::npos) {
+                        in_header_block = true;
+                    } else if (line.find("HEADER_BLOCK_END") != std::string::npos) {
+                        in_header_block = false;
+                    } else if (in_header_block) {
+                        // Strip leading "; " to get "key: value".
+                        std::string kv = line;
+                        if (kv.size() >= 2 && kv[0] == ';') {
+                            kv = kv.substr(1);
+                            boost::trim_left(kv);
+                        }
+                        size_t colon = kv.find(':');
+                        if (colon != std::string::npos) {
+                            std::string key{kv.substr(0, colon)};
+                            std::string val{kv.substr(colon + 1)};
+                            boost::trim(key);
+                            boost::trim(val);
+                            if (!key.empty() && !val.empty()) {
+                                // Map "total layer number" -> "total_layer_number" for macro access.
+                                if (key == "total layer number") {
+                                    key = "total_layer_number";
+                                    try {
+                                        total_layers = std::stoi(val);
+                                    } catch (...) {
+                                        BOOST_LOG_TRIVIAL(warning) << "GCode macro: invalid total_layer_number '"
+                                            << val << "'. {last_layer} will always be false.";
+                                    }
+                                }
+                                // Register in the parser config for macro resolution.
+                                // Use type-aware dispatch: try integer first, then float, then fall back to string.
+                                // This ensures numeric variables (total_layer_number, max_z_height, etc.)
+                                // are registered as ConfigOptionInt/ConfigOptionFloat, not ConfigOptionString,
+                                // so they work correctly in numeric contexts and as array indices.
+                                try {
+                                    // Integer: no decimal point, no comma (comma = array delimiter)
+                                    if (val.find('.') == std::string::npos && val.find(',') == std::string::npos)
+                                        parser.set(key, std::stoi(val));
+                                    else
+                                        throw std::invalid_argument("not an int");
+                                } catch (...) {
+                                    try {
+                                        // Float: has decimal point, no comma
+                                        if (val.find(',') == std::string::npos)
+                                            parser.set(key, std::stod(val));
+                                        else
+                                            throw std::invalid_argument("not a float");
+                                    } catch (...) {
+                                        // Fallback: string (for non-numeric or comma-delimited values)
+                                        parser.set(key, val);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---- Robust tool splitting ----
+                // Primary boundary: "; CP TOOLCHANGE START" (wipe tower / multi-color).
+                // When hit, collect lines (including the T command inside) until
+                // "; CP TOOLCHANGE END". The entire sequence stays in one color chunk.
+                // The T command inside sets the new color scope.
+                if (is_toolchange_start(line)) {
+                    if (in_layer) {
+                        // Flush previous color chunk.
+                        BOOST_LOG_TRIVIAL(debug) << "GCode substitution: CP TOOLCHANGE START — flushing color chunk "
+                            << color_count << " (color_chunk=" << color_chunk.size() << " bytes)";
+                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, scope.current_extruder());
+                        if (any_macros) scope.exit_color();
+                    }
+                    in_toolchange_sequence = true;
+                    color_chunk.append(line).push_back('\n');
+                // ; CP TOOLCHANGE END — end of wipe tower toolchange sequence.
+                } else if (is_toolchange_end(line)) {
+                    in_toolchange_sequence = false;
+                    color_chunk.append(line).push_back('\n');
                 // EXECUTABLE_BLOCK_START — start of first layer (layer 0).
                 // Content between EXECUTABLE_BLOCK_START and ;LAYER_CHANGE includes
                 // actual G-code that belongs to layer 0, not the preamble.
-                if (is_executable_block_start(line)) {
+                } else if (is_executable_block_start(line)) {
+                    // Initialize scope manager now that we have total_layers from HEADER_BLOCK.
+                    if (any_macros) {
+                        if (total_layers == 0) {
+                            // Fallback: try DynamicPrintConfig (will typically be null for this key).
+                            auto it = parser.option("total_layer_count");
+                            if (it) {
+                                try {
+                                    total_layers = std::stoi(it->serialize());
+                                } catch (...) {
+                                    BOOST_LOG_TRIVIAL(warning) << "GCode macro: invalid total_layer_count '"
+                                        << it->serialize() << "'. {last_layer} will always be false.";
+                                }
+                            }
+                        }
+                        scope.set_total_layers(total_layers);
+                    }
                     if (!in_layer) {
                         // Preamble — enter global scope.
                         if (any_macros) scope.enter_global();
                         // Flush any color chunk that accumulated in the preamble.
-                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer);
+                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, scope.current_extruder());
                         BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing preamble (" << layer_content.size() << " bytes)";
                         // Flush preamble to output.
-                        flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer);
+                        flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer, scope.current_extruder());
                     }
                     // Start layer 0 with this marker.
                     if (any_macros) {
@@ -1208,10 +1342,21 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                         // Fallback: no EXECUTABLE_BLOCK_START found, treat first
                         // ;LAYER_CHANGE as layer 0 start (backward compatibility).
                         if (any_macros) scope.enter_global();
-                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer);
+                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, scope.current_extruder());
                         BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing preamble (" << layer_content.size() << " bytes)";
-                        flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer);
+                        flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer, scope.current_extruder());
                         if (any_macros) {
+                            // Look up total_layer_count from parser config (set during HEADER_BLOCK
+                            // parsing or from print config) so {last_layer} works in the fallback path.
+                            if (auto it = parser.config().option("total_layer_count")) {
+                                try {
+                                    total_layers = std::stoi(it->serialize());
+                                } catch (...) {
+                                    BOOST_LOG_TRIVIAL(warning) << "GCode macro: invalid total_layer_count '"
+                                        << it->serialize() << "'. {last_layer} will always be false.";
+                                }
+                            }
+                            scope.set_total_layers(total_layers);
                             scope.enter_layer(0, 0.0, 0.0);
                             layer_z_set = false;
                             layer_height_set = false;
@@ -1230,11 +1375,11 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                         // Subsequent layer — flush previous layer.
                         BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing layer " << layer_count
                             << " (layer_content=" << layer_content.size() << " bytes)";
-                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer);
+                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, scope.current_extruder());
                         // Don't exit_color here — the ;LAYER_CHANGE line is the first line
-                        // of the new color chunk, and color_chunk_num/tool_num should carry over
+                        // of the new color chunk, and color_chunk_num/current_extruder should carry over
                         // from the previous layer until a new T command is encountered.
-                        flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer);
+                        flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer, scope.current_extruder());
                         if (any_macros) scope.exit_layer();
                         // Start new layer.
                         ++layer_count;
@@ -1247,13 +1392,17 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                         color_count = 0;
                         color_chunk.append(line).push_back('\n');
                     }
-                // Bare T command (T0, T1, T2, ...) — tool change / color boundary
-                } else if (is_bare_t_command(line)) {
+                // Bare T command (T0, T1, T2, ...) — tool change / color boundary.
+                // FALLBACK: only if NOT inside a wipe-tower toolchange sequence.
+                // When inside ; CP TOOLCHANGE START ... END, the T command is part
+                // of the full unload/T/load/wipe sequence and should stay in the
+                // same color chunk. The T command inside sets the new color scope.
+                } else if (is_bare_t_command(line) && !in_toolchange_sequence) {
                     // Flush previous color chunk within current layer.
                     BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing color chunk " << color_count
                         << " (color_chunk=" << color_chunk.size() << " bytes)";
                     // Flush color chunk BEFORE exiting color scope (so color-scoped vars are available).
-                    flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer);
+                    flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, scope.current_extruder());
                     // Exit previous color scope.
                     if (any_macros) scope.exit_color();
                     // Parse the actual tool number from the T command.
@@ -1261,24 +1410,48 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                         size_t tpos = 0;
                         while (tpos < line.size() && line[tpos] == ' ')
                             ++tpos;
-                        int tool_num = 0;
+                        int current_extruder = 0;
                         if (tpos < line.size() && line[tpos] == 'T') {
                             size_t dpos = tpos + 1;
                             while (dpos < line.size() && std::isdigit(static_cast<unsigned char>(line[dpos])))
-                                tool_num = tool_num * 10 + (line[dpos++] - '0');
+                                current_extruder = current_extruder * 10 + (line[dpos++] - '0');
                         }
                         ++color_count;
                         if (any_macros)
-                            scope.enter_color(color_count, tool_num);
+                            scope.enter_color(color_count, current_extruder);
+                    }
+                    color_chunk.append(line).push_back('\n');
+                // Bare T command inside toolchange sequence — set color scope but
+                // do NOT split the chunk (keep unload/T/load/wipe together).
+                // The entire ; CP TOOLCHANGE START ... T ... ; CP TOOLCHANGE END
+                // stays in one color chunk so color substitution rules apply to
+                // the full sequence.
+                } else if (is_bare_t_command(line) && in_toolchange_sequence) {
+                    // Parse the tool number and set the color scope.
+                    {
+                        size_t tpos = 0;
+                        while (tpos < line.size() && line[tpos] == ' ')
+                            ++tpos;
+                        int current_extruder = 0;
+                        if (tpos < line.size() && line[tpos] == 'T') {
+                            size_t dpos = tpos + 1;
+                            while (dpos < line.size() && std::isdigit(static_cast<unsigned char>(line[dpos])))
+                                current_extruder = current_extruder * 10 + (line[dpos++] - '0');
+                        }
+                        // Set new color scope without flushing — the whole
+                        // toolchange sequence stays in one chunk.
+                        ++color_count;
+                        if (any_macros)
+                            scope.enter_color(color_count, current_extruder);
                     }
                     color_chunk.append(line).push_back('\n');
                 // EXECUTABLE_BLOCK_END — end of last layer, start of suffix
                 } else if (is_executable_block_end(line)) {
                     // Flush the last layer's color chunk and layer chunk.
                     BOOST_LOG_TRIVIAL(debug) << "GCode substitution: EXECUTABLE_BLOCK_END — flushing last layer";
-                    flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer);
+                    flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, scope.current_extruder());
                     if (any_macros) scope.exit_color();
-                    flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer);
+                    flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer, scope.current_extruder());
                     if (any_macros) scope.exit_layer();
                     // Exit layer mode — subsequent lines are suffix.
                     in_layer = false;
@@ -1320,8 +1493,8 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
             BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing final color chunk ("
                 << color_chunk.size() << " bytes), final layer_content ("
                 << layer_content.size() << " bytes)";
-            flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer);
-            flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer);
+            flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, scope.current_extruder());
+            flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer, scope.current_extruder());
 
             BOOST_LOG_TRIVIAL(debug) << "GCode substitution: processed " << layer_count
                 << " layers";

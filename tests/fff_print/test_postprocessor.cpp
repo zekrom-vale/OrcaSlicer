@@ -998,3 +998,221 @@ SCENARIO("GCode Substitution: run_post_process integration", "[PostProcessor]") 
         std::filesystem::remove(in_path);
     }
 }
+
+SCENARIO("GCode Substitution: current_extruder macro", "[PostProcessor]") {
+    GIVEN("current_extruder is set after bare T command in color chunk") {
+        std::string input =
+            ";LAYER_CHANGE\n"
+            "T1\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        // Use {current_extruder} in replacement.
+        auto config = make_config("s/E10/E{current_extruder}00/C");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("current_extruder resolves to 1") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            REQUIRE(output.find("E100") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("tool_num is NOT recognized (no backward compatibility)") {
+        std::string input =
+            ";LAYER_CHANGE\n"
+            "T1\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E{tool_num}00/C");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("tool_num is not resolved, substitution may fail or produce literal") {
+            REQUIRE(modified == false);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+}
+
+SCENARIO("GCode Substitution: HEADER_BLOCK parsing", "[PostProcessor]") {
+    GIVEN("HEADER_BLOCK contains total layer number") {
+        std::string input =
+            "; HEADER_BLOCK_START\n"
+            "; total layer number: 42\n"
+            "; max z height: 123.45\n"
+            "; HEADER_BLOCK_END\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E{total_layer_number}/");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("total_layer_number resolves to 42") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            REQUIRE(output.find("E42") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("HEADER_BLOCK contains max_z_height") {
+        std::string input =
+            "; HEADER_BLOCK_START\n"
+            "; total layer number: 42\n"
+            "; max z height: 123.45\n"
+            "; HEADER_BLOCK_END\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E{max_z_height}/");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("max_z_height resolves to 123.45") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            REQUIRE(output.find("E123.45") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+}
+
+SCENARIO("GCode Substitution: {last_layer} in compatible-mode (no EXECUTABLE_BLOCK_START)", "[PostProcessor]") {
+    GIVEN("HEADER_BLOCK with total layer number, no EXECUTABLE_BLOCK_START, using ;LAYER_CHANGE") {
+        // Compatible-mode G-code: HEADER_BLOCK provides total layer count,
+        // but there is no EXECUTABLE_BLOCK_START marker. The fallback path
+        // must still set total_layers so {last_layer} resolves correctly.
+        std::string input =
+            "; HEADER_BLOCK_START\n"
+            "; total layer number: 3\n"
+            "; HEADER_BLOCK_END\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n"
+            ";LAYER_CHANGE\n"
+            "G1 E20\n"
+            ";LAYER_CHANGE\n"
+            "G1 E30\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        // Replace E10/E20/E30 with E{last_layer} to verify the macro resolves.
+        auto config = make_config("s/E10/E{last_layer}/\ns/E20/E{last_layer}/\ns/E30/E{last_layer}/");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("last_layer resolves correctly: false for layers 0 and 1, true for layer 2") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            // Layer 0 (first layer) — not last
+            REQUIRE(output.find("Efalse") != std::string::npos);
+            // Layer 2 (third and final layer) — is last
+            REQUIRE(output.find("Etrue") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("no HEADER_BLOCK at all — total_layers defaults to 0, {last_layer} is false for layer 0") {
+        // When there is no HEADER_BLOCK and no EXECUTABLE_BLOCK_START,
+        // total_layers defaults to 0, so layer 0 == m_total_layers - 1 is false.
+        std::string input =
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E{last_layer}/");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("last_layer is false when total_layers is unknown (0)") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            REQUIRE(output.find("Efalse") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+}
+
+SCENARIO("GCode Substitution: CP TOOLCHANGE robust tool splitting", "[PostProcessor]") {
+    GIVEN("CP TOOLCHANGE START..END keeps bare T inside one color chunk") {
+        std::string input =
+            ";LAYER_CHANGE\n"
+            "G1 E10\n"
+            "; CP TOOLCHANGE START\n"
+            "T1\n"
+            "G1 E20\n"
+            "; CP TOOLCHANGE END\n"
+            "G1 E30\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/C\ns/E30/E300/C");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("E10 is replaced but E30 is in a separate color chunk") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            REQUIRE(output.find("E100") != std::string::npos);
+            REQUIRE(output.find("E300") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("bare T outside TOOLCHANGE sequence splits color chunk") {
+        std::string input =
+            ";LAYER_CHANGE\n"
+            "T0\n"
+            "G1 E10\n"
+            "T1\n"
+            "G1 E20\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/C");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("E10 is replaced in its color chunk") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            REQUIRE(output.find("E100") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+}
