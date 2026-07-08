@@ -1240,35 +1240,34 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                                 // Map "total layer number" -> "total_layer_number" for macro access.
                                 if (key == "total layer number") {
                                     key = "total_layer_number";
-                                    try {
-                                        total_layers = std::stoi(val);
-                                    } catch (...) {
+                                    if (auto it = val.cbegin(); std::from_chars(it, val.cend(), total_layers).ptr != val.cend())
+                                        ; // success
+                                    else
                                         BOOST_LOG_TRIVIAL(warning) << "GCode macro: invalid total_layer_number '"
                                             << val << "'. {last_layer} will always be false.";
-                                    }
                                 }
                                 // Register in the parser config for macro resolution.
                                 // Use type-aware dispatch: try integer first, then float, then fall back to string.
                                 // This ensures numeric variables (total_layer_number, max_z_height, etc.)
                                 // are registered as ConfigOptionInt/ConfigOptionFloat, not ConfigOptionString,
                                 // so they work correctly in numeric contexts and as array indices.
-                                try {
+                                if (val.find('.') == std::string::npos && val.find(',') == std::string::npos) {
                                     // Integer: no decimal point, no comma (comma = array delimiter)
-                                    if (val.find('.') == std::string::npos && val.find(',') == std::string::npos)
-                                        parser.set(key, std::stoi(val));
+                                    int ival;
+                                    if (auto it = val.cbegin(); std::from_chars(it, val.cend(), ival).ptr == val.cend())
+                                        parser.set(key, ival);
                                     else
-                                        throw std::invalid_argument("not an int");
-                                } catch (...) {
-                                    try {
-                                        // Float: has decimal point, no comma
-                                        if (val.find(',') == std::string::npos)
-                                            parser.set(key, std::stod(val));
-                                        else
-                                            throw std::invalid_argument("not a float");
-                                    } catch (...) {
-                                        // Fallback: string (for non-numeric or comma-delimited values)
                                         parser.set(key, val);
-                                    }
+                                } else if (val.find(',') == std::string::npos) {
+                                    // Float: has decimal point, no comma
+                                    double fval;
+                                    if (auto it = val.cbegin(); std::from_chars(it, val.cend(), fval).ptr == val.cend())
+                                        parser.set(key, fval);
+                                    else
+                                        parser.set(key, val);
+                                } else {
+                                    // Fallback: string (for non-numeric or comma-delimited values)
+                                    parser.set(key, val);
                                 }
                             }
                         }
