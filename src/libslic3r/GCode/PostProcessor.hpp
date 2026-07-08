@@ -12,6 +12,9 @@
 
 namespace Slic3r {
 
+// Forward declaration for Print — used by run_post_process to derive config.
+class Print;
+
 // Block type for substitution rules — controls the scope of the substitution.
 // None = layer block (default), Color = color/toolhead block.
 enum class GCodeSubBlockType : uint8_t
@@ -32,6 +35,13 @@ struct GCodeSubRule
     bool format_first_only = false;
     // Pre-compiled regex — set during parsing to avoid per-chunk compilation.
     std::optional<boost::regex> compiled_regex;
+    // Macro metadata — populated at parse time.
+    struct MacroMeta {
+        bool has_macros = false;  // quick check: does replacement contain {var}?
+    };
+    MacroMeta macro_meta;
+    // M flag — metadata-only mode (skip preamble/suffix, only apply within layer chunks).
+    bool metadata_only = false;
 };
 
 // Parse the raw substitution config options into a vector of GCodeSubRule.
@@ -62,13 +72,21 @@ extern bool run_post_process_scripts(std::string &src_path, const std::string &h
 // Returns true if substitutions were applied.
 // Returns false if no gcode_substitutions were defined.
 // Throws an exception on error.
-extern bool apply_gcode_substitutions(const std::string &in_path, const std::string &out_path, std::vector<GCodeSubRule> &&all_rules);
+extern bool apply_gcode_substitutions(const std::string &in_path, const std::string &out_path, std::vector<GCodeSubRule> &&all_rules, const DynamicPrintConfig &config);
 
 // Combined post-processor: applies substitutions then runs scripts.
 // If make_copy and either feature is active, creates a .pp copy to protect
 // the memory-mapped previewer handle. Returns true if any post-processing
 // work was done (caller must delete the .pp temp file when make_copy=true).
 // Throws an exception on error.
+// When print is provided, full_print_config() is derived from it and merged
+// with PrintStatistics::config() so all runtime variables (initial_extruder,
+// print_time, used_filament, etc.) are available to PlaceholderParser macros
+// and exported as environment variables via setenv_().
+extern bool run_post_process(std::string &src_path, bool make_copy, const std::string &host, std::string &output_name, const Print *print);
+
+// Overload for backwards compatibility — takes config directly (no runtime
+// variables from PrintStatistics).
 extern bool run_post_process(std::string &src_path, bool make_copy, const std::string &host, std::string &output_name, const DynamicPrintConfig &config);
 
 // BBS

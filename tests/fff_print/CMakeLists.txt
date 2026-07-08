@@ -1,5 +1,5 @@
 get_filename_component(_TEST_NAME ${CMAKE_CURRENT_LIST_DIR} NAME)
-add_executable(${_TEST_NAME}_tests 
+add_executable(${_TEST_NAME}_tests
 	${_TEST_NAME}_tests.cpp
 	test_data.cpp
 	test_data.hpp
@@ -9,6 +9,7 @@ add_executable(${_TEST_NAME}_tests
 	test_gcode.cpp
 	test_gcodewriter.cpp
 	test_model.cpp
+	test_postprocessor.cpp
 	test_print.cpp
 	test_printgcode.cpp
 	test_printobject.cpp

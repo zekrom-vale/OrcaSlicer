@@ -374,7 +374,13 @@ class Print;
         };
 
         static const std::string& reserved_tag(ETags tag) { return s_IsBBLPrinter ? Reserved_Tags[static_cast<unsigned char>(tag)] : Reserved_Tags_compatible[static_cast<unsigned char>(tag)]; }
-        // checks the given gcode for reserved tags and returns true when finding the 1st (which is returned into found_tag) 
+        // Returns both BBL and compatible tag strings for a given ETags enum.
+        // Useful for post-processor marker detection that must work regardless of which variant the G-code was generated with.
+        static std::pair<std::string_view, std::string_view> reserved_tag_variants(ETags tag)
+        {
+            return { Reserved_Tags[static_cast<unsigned char>(tag)], Reserved_Tags_compatible[static_cast<unsigned char>(tag)] };
+        }
+        // checks the given gcode for reserved tags and returns true when finding the 1st (which is returned into found_tag)
         static bool contains_reserved_tag(const std::string& gcode, std::string& found_tag);
         // checks the given gcode for reserved tags and returns true when finding any
         // (the first max_count found tags are returned into found_tag)
