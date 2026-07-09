@@ -40,8 +40,10 @@ struct GCodeSubRule
         bool has_macros = false;  // quick check: does replacement contain {var}?
     };
     MacroMeta macro_meta;
-    // M flag — metadata-only mode (skip preamble/suffix, only apply within layer chunks).
+    // M flag — metadata-only mode (preamble/suffix only).
     bool metadata_only = false;
+    // P flag — preprint-only mode (PrePrint section only, between EXECUTABLE_BLOCK_START and first LAYER_CHANGE).
+    bool preprint_only = false;
 };
 
 // Parse the raw substitution config options into a vector of GCodeSubRule.

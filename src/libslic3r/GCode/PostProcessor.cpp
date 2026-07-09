@@ -382,9 +382,13 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
                     block_type = GCodeSubBlockType::Color;
                 rule.block_type = block_type;
 
-                // Parse M flag — metadata-only mode (skip preamble/suffix).
+                // Parse M flag — metadata-only mode (preamble/suffix only).
                 bool has_M = flags.find('M') != std::string::npos;
                 rule.metadata_only = has_M;
+
+                // Parse P flag — preprint-only mode (PrePrint section only).
+                bool has_P = flags.find('P') != std::string::npos;
+                rule.preprint_only = has_P;
 
                 // Reject conflicting section mode flags: M (metadata), C (color block),
                 // P (pending) are mutually exclusive.  Combining any two or more produces
@@ -406,10 +410,10 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
                     }
                 }
 
-                // Warn on unknown flags — known flags: i, n, c, m, s, f, x, C, M.
+                // Warn on unknown flags — known flags: i, n, c, m, s, f, x, C, M, P.
                 for (char fc : flags) {
                     if (fc != 'i' && fc != 'n' && fc != 'c' && fc != 'm' &&
-                        fc != 's' && fc != 'f' && fc != 'x' && fc != 'C' && fc != 'M') {
+                        fc != 's' && fc != 'f' && fc != 'x' && fc != 'C' && fc != 'M' && fc != 'P') {
                         BOOST_LOG_TRIVIAL(warning) << "GCode substitution: unknown flag '" << fc
                             << "' in rule: " << line;
                     }
@@ -855,10 +859,34 @@ public:
     // Check if we are currently inside a layer chunk.
     bool in_layer() const { return m_in_layer; }
 
+    // Enter PrePrint section (between EXECUTABLE_BLOCK_START and first LAYER_CHANGE).
+    // No layer vars available. layer_num defaults to -1 to distinguish from layer 0.
+    void enter_preprint()
+    {
+        m_in_layer = false;
+        m_in_preprint = true;
+        m_parser.set("layer_num", -1);
+        m_parser.set("first_layer", false);
+        m_parser.set("last_layer", false);
+    }
+
+    // Exit PrePrint section.
+    void exit_preprint()
+    {
+        m_parser.config_writable().erase("layer_num");
+        m_parser.config_writable().erase("first_layer");
+        m_parser.config_writable().erase("last_layer");
+        m_in_preprint = false;
+    }
+
+    // Check if we are currently inside the PrePrint section.
+    bool in_preprint() const { return m_in_preprint; }
+
     private:
         PlaceholderParser& m_parser;
         int m_total_layers = 0;  // default: no layers known until HEADER_BLOCK or config lookup
         bool m_in_layer = false;
+        bool m_in_preprint = false;
         int m_layer_num = 0;
         int m_color_chunk_num = 0;
         int m_current_extruder = 0;  // tracked extruder for PlaceholderParser::process()
@@ -994,8 +1022,9 @@ static bool apply_rule_to_string(GCodeSubRule &rule, std::string &src,
 }
 
 // Apply rules to a string buffer. Updates modified flag if any rule matched.
-// M-flagged (metadata_only) rules run ONLY on preamble/suffix (in_layer=false).
-// Non-M rules run ONLY on layer/color chunks (in_layer=true).
+// M-flagged (metadata_only) rules run ONLY on preamble/suffix (in_layer=false, in_preprint=false).
+// P-flagged (preprint_only) rules run ONLY on PrePrint section (in_preprint=true).
+// Non-M, non-P rules run ONLY on layer/color chunks (in_layer=true).
 // When is_layer_rule is true, color-specific macros (color_chunk_num, current_extruder) are
 // temporarily hidden so layer rules cannot reference color variables.
 static void apply_rules_to_string(
@@ -1004,6 +1033,7 @@ static void apply_rules_to_string(
     bool &modified,
     PlaceholderParser* parser,
     bool in_layer,
+    bool in_preprint,
     bool is_layer_rule,
     int current_extruder_id)
 {
@@ -1011,7 +1041,8 @@ static void apply_rules_to_string(
         return;
 
     // When applying layer rules, temporarily hide color-specific macros.
-    if (is_layer_rule) {
+    // Only do this when parser is non-null (i.e., at least one rule has macros).
+    if (is_layer_rule && parser) {
         auto &cfg = parser->config_writable();
         const ConfigOption *color_chunk_num_opt = cfg.option("color_chunk_num");
         const ConfigOption *current_extruder_opt = cfg.option("current_extruder");
@@ -1028,11 +1059,14 @@ static void apply_rules_to_string(
             cfg.erase("current_extruder");
 
         for (auto *rule : rules) {
-            // M-flagged rules: run ONLY on preamble/suffix (skip when in a layer).
-            if (rule->metadata_only && in_layer)
+            // M-flagged rules: run ONLY on preamble/suffix (skip when in layer or PrePrint).
+            if (rule->metadata_only && (in_layer || in_preprint))
                 continue;
-            // Non-M rules: run ONLY on layer/color chunks (skip preamble/suffix).
-            if (!rule->metadata_only && !in_layer)
+            // P-flagged rules: run ONLY on PrePrint section.
+            if (rule->preprint_only && !in_preprint)
+                continue;
+            // Non-M, non-P rules: run ONLY on layer/color chunks (skip preamble, suffix, and PrePrint).
+            if (!rule->metadata_only && !rule->preprint_only && !in_layer)
                 continue;
             if (apply_rule_to_string(*rule, buf, parser, current_extruder_id))
                 modified = true;
@@ -1046,11 +1080,14 @@ static void apply_rules_to_string(
     }
     else {
         for (auto *rule : rules) {
-            // M-flagged rules: run ONLY on preamble/suffix (skip when in a layer).
-            if (rule->metadata_only && in_layer)
+            // M-flagged rules: run ONLY on preamble/suffix (skip when in layer or PrePrint).
+            if (rule->metadata_only && (in_layer || in_preprint))
                 continue;
-            // Non-M rules: run ONLY on layer/color chunks (skip preamble/suffix).
-            if (!rule->metadata_only && !in_layer)
+            // P-flagged rules: run ONLY on PrePrint section.
+            if (rule->preprint_only && !in_preprint)
+                continue;
+            // Non-M, non-P rules: run ONLY on layer/color chunks (skip preamble, suffix, and PrePrint).
+            if (!rule->metadata_only && !rule->preprint_only && !in_layer)
                 continue;
             if (apply_rule_to_string(*rule, buf, parser, current_extruder_id))
                 modified = true;
@@ -1068,12 +1105,13 @@ static void flush_color_chunk(
     bool &modified,
     PlaceholderParser* parser,
     bool in_layer,
+    bool in_preprint,
     int current_extruder_id)
 {
     if (color_chunk.empty())
         return;
 
-    apply_rules_to_string(color_chunk, color_rules, modified, parser, in_layer, false, current_extruder_id);
+    apply_rules_to_string(color_chunk, color_rules, modified, parser, in_layer, in_preprint, false, current_extruder_id);
     dest.append(color_chunk);
     color_chunk.clear();
 }
@@ -1087,12 +1125,13 @@ static void flush_layer_chunk(
     bool &modified,
     PlaceholderParser* parser,
     bool in_layer,
+    bool in_preprint,
     int current_extruder_id)
 {
     if (layer_content.empty())
         return;
 
-    apply_rules_to_string(layer_content, layer_rules, modified, parser, in_layer, true, current_extruder_id);
+    apply_rules_to_string(layer_content, layer_rules, modified, parser, in_layer, in_preprint, true, current_extruder_id);
     size_t cnt_written = ::fwrite(layer_content.data(), 1, layer_content.size(), out);
     if (::ferror(out) || cnt_written != layer_content.size())
         throw Slic3r::RuntimeError(Slic3r::format("GCode substitution failed. Error writing file."));
@@ -1190,6 +1229,7 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
             std::string color_chunk;    // accumulates lines for current color
             std::string layer_content;  // accumulates processed color chunks (also used for preamble/suffix)
             bool in_layer = false;
+            bool in_preprint = false;
 
             // Dynamically calculated values from the G-code HEADER_BLOCK.
             // These are not static config variables — they are computed by the
@@ -1238,7 +1278,7 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                 // the slicer (total_layer_number, max_z_height, etc.) and are
                 // not available as static config variables.
                 // Format: "; key: value" where value may be comma-delimited array.
-                if (!in_layer && any_macros) {
+                if ((!in_layer && !in_preprint) && any_macros) {
                     if (line.find("HEADER_BLOCK_START") != std::string::npos) {
                         in_header_block = true;
                     } else if (line.find("HEADER_BLOCK_END") != std::string::npos) {
@@ -1260,7 +1300,7 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                                 // Map "total layer number" -> "total_layer_number" for macro access.
                                 if (key == "total layer number") {
                                     key = "total_layer_number";
-                                    if (auto it = val.cbegin(); std::from_chars(it, val.cend(), total_layers).ptr != val.cend())
+                                    if (auto it = val.data(); std::from_chars(it, val.data() + val.size(), total_layers).ptr != val.data() + val.size())
                                         ; // success
                                     else
                                         BOOST_LOG_TRIVIAL(warning) << "GCode macro: invalid total_layer_number '"
@@ -1274,14 +1314,14 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                                 if (val.find('.') == std::string::npos && val.find(',') == std::string::npos) {
                                     // Integer: no decimal point, no comma (comma = array delimiter)
                                     int ival;
-                                    if (auto it = val.cbegin(); std::from_chars(it, val.cend(), ival).ptr == val.cend())
+                                    if (auto it = val.data(); std::from_chars(it, val.data() + val.size(), ival).ptr == val.data() + val.size())
                                         parser.set(key, ival);
                                     else
                                         parser.set(key, val);
                                 } else if (val.find(',') == std::string::npos) {
                                     // Float: has decimal point, no comma
                                     double fval;
-                                    if (auto it = val.cbegin(); std::from_chars(it, val.cend(), fval).ptr == val.cend())
+                                    if (auto it = val.data(); std::from_chars(it, val.data() + val.size(), fval).ptr == val.data() + val.size())
                                         parser.set(key, fval);
                                     else
                                         parser.set(key, val);
@@ -1304,15 +1344,25 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                         // Flush previous color chunk.
                         BOOST_LOG_TRIVIAL(debug) << "GCode substitution: CP TOOLCHANGE START — flushing color chunk "
                             << color_count << " (color_chunk=" << color_chunk.size() << " bytes)";
-                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, scope.current_extruder());
+                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, in_preprint, scope.current_extruder());
                         if (any_macros) scope.exit_color();
                     }
                     in_toolchange_sequence = true;
-                    color_chunk.append(line).push_back('\n');
+                    // Route to correct buffer based on current section.
+                    if (in_layer) {
+                        color_chunk.append(line).push_back('\n');
+                    } else {
+                        layer_content.append(line).push_back('\n');
+                    }
                 // ; CP TOOLCHANGE END — end of wipe tower toolchange sequence.
                 } else if (is_toolchange_end(line)) {
                     in_toolchange_sequence = false;
-                    color_chunk.append(line).push_back('\n');
+                    // Route to correct buffer based on current section.
+                    if (in_layer) {
+                        color_chunk.append(line).push_back('\n');
+                    } else {
+                        layer_content.append(line).push_back('\n');
+                    }
                 // EXECUTABLE_BLOCK_START — start of first layer (layer 0).
                 // Content between EXECUTABLE_BLOCK_START and ;LAYER_CHANGE includes
                 // actual G-code that belongs to layer 0, not the preamble.
@@ -1337,21 +1387,16 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                         // Preamble — enter global scope.
                         if (any_macros) scope.enter_global();
                         // Flush any color chunk that accumulated in the preamble.
-                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, scope.current_extruder());
+                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, in_preprint, scope.current_extruder());
                         BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing preamble (" << layer_content.size() << " bytes)";
                         // Flush preamble to output.
-                        flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer, scope.current_extruder());
+                        flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer, in_preprint, scope.current_extruder());
                     }
-                    // Start layer 0 with this marker.
-                    if (any_macros) {
-                        scope.enter_layer(0, 0.0, 0.0);
-                        layer_z_set = false;
-                        layer_height_set = false;
-                        height_lookahead = max_height_lookahead;
-                    }
-                    in_layer = true;
+                    // Enter PrePrint section (between EXECUTABLE_BLOCK_START and first LAYER_CHANGE).
+                    if (any_macros) scope.enter_preprint();
+                    in_preprint = true;
                     color_count = 0;
-                    color_chunk.append(line).push_back('\n');
+                    layer_content.append(line).push_back('\n'); // PrePrint goes to layer_content, NOT color_chunk
                 // ;LAYER_CHANGE — layer boundary.
                 // When EXECUTABLE_BLOCK_START started layer 0, the first ;LAYER_CHANGE
                 // is skipped because the content before it belongs to layer 0.
@@ -1361,9 +1406,9 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                         // Fallback: no EXECUTABLE_BLOCK_START found, treat first
                         // ;LAYER_CHANGE as layer 0 start (backward compatibility).
                         if (any_macros) scope.enter_global();
-                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, scope.current_extruder());
+                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, in_preprint, scope.current_extruder());
                         BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing preamble (" << layer_content.size() << " bytes)";
-                        flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer, scope.current_extruder());
+                        flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer, in_preprint, scope.current_extruder());
                         if (any_macros) {
                             // Look up total_layer_count from parser config (set during HEADER_BLOCK
                             // parsing or from print config) so {last_layer} works in the fallback path.
@@ -1384,6 +1429,26 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                         in_layer = true;
                         color_count = 0;
                         color_chunk.append(line).push_back('\n');
+                    } else if (in_preprint) {
+                        // First ;LAYER_CHANGE after EXECUTABLE_BLOCK_START — end of PrePrint, start of layer 0.
+                        // Flush PrePrint content BEFORE exiting PrePrint scope (so P-flagged rules still apply).
+                        BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing PrePrint (" << layer_content.size() << " bytes)";
+                        // No color_chunk flush needed — PrePrint lines went to layer_content directly.
+                        flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer, in_preprint, scope.current_extruder());
+                        // Now exit PrePrint scope.
+                        if (any_macros) scope.exit_preprint();
+                        in_preprint = false;
+                        // Now enter layer 0.
+                        if (any_macros) {
+                            scope.enter_layer(0, 0.0, 0.0);
+                            layer_z_set = false;
+                            layer_height_set = false;
+                            height_lookahead = max_height_lookahead;
+                        }
+                        in_layer = true;
+                        skipped_first_layer_marker = true;
+                        color_count = 0;
+                        color_chunk.append(line).push_back('\n');
                     } else if (skipped_first_layer_marker == false && layer_count == 0) {
                         // First ;LAYER_CHANGE after EXECUTABLE_BLOCK_START — skip it.
                         // Layer 0's Height tag appears after this marker.
@@ -1394,11 +1459,11 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                         // Subsequent layer — flush previous layer.
                         BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing layer " << layer_count
                             << " (layer_content=" << layer_content.size() << " bytes)";
-                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, scope.current_extruder());
+                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, in_preprint, scope.current_extruder());
                         // Don't exit_color here — the ;LAYER_CHANGE line is the first line
                         // of the new color chunk, and color_chunk_num/current_extruder should carry over
                         // from the previous layer until a new T command is encountered.
-                        flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer, scope.current_extruder());
+                        flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer, in_preprint, scope.current_extruder());
                         if (any_macros) scope.exit_layer();
                         // Start new layer.
                         ++layer_count;
@@ -1418,12 +1483,14 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                 // same color chunk. The T command inside sets the new color scope.
                 } else if (is_bare_t_command(line) && !in_toolchange_sequence) {
                     // Flush previous color chunk within current layer.
-                    BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing color chunk " << color_count
-                        << " (color_chunk=" << color_chunk.size() << " bytes)";
-                    // Flush color chunk BEFORE exiting color scope (so color-scoped vars are available).
-                    flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, scope.current_extruder());
-                    // Exit previous color scope.
-                    if (any_macros) scope.exit_color();
+                    if (in_layer) {
+                        BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing color chunk " << color_count
+                            << " (color_chunk=" << color_chunk.size() << " bytes)";
+                        // Flush color chunk BEFORE exiting color scope (so color-scoped vars are available).
+                        flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, in_preprint, scope.current_extruder());
+                        // Exit previous color scope.
+                        if (any_macros) scope.exit_color();
+                    }
                     // Parse the actual tool number from the T command.
                     {
                         size_t tpos = 0;
@@ -1439,7 +1506,12 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                         if (any_macros)
                             scope.enter_color(color_count, current_extruder);
                     }
-                    color_chunk.append(line).push_back('\n');
+                    // Route to correct buffer based on current section.
+                    if (in_layer) {
+                        color_chunk.append(line).push_back('\n');
+                    } else {
+                        layer_content.append(line).push_back('\n');
+                    }
                 // Bare T command inside toolchange sequence — set color scope but
                 // do NOT split the chunk (keep unload/T/load/wipe together).
                 // The entire ; CP TOOLCHANGE START ... T ... ; CP TOOLCHANGE END
@@ -1463,14 +1535,19 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                         if (any_macros)
                             scope.enter_color(color_count, current_extruder);
                     }
-                    color_chunk.append(line).push_back('\n');
+                    // Route to correct buffer based on current section.
+                    if (in_layer) {
+                        color_chunk.append(line).push_back('\n');
+                    } else {
+                        layer_content.append(line).push_back('\n');
+                    }
                 // EXECUTABLE_BLOCK_END — end of last layer, start of suffix
                 } else if (is_executable_block_end(line)) {
                     // Flush the last layer's color chunk and layer chunk.
                     BOOST_LOG_TRIVIAL(debug) << "GCode substitution: EXECUTABLE_BLOCK_END — flushing last layer";
-                    flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, scope.current_extruder());
+                    flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, in_preprint, scope.current_extruder());
                     if (any_macros) scope.exit_color();
-                    flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer, scope.current_extruder());
+                    flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer, in_preprint, scope.current_extruder());
                     if (any_macros) scope.exit_layer();
                     // Exit layer mode — subsequent lines are suffix.
                     in_layer = false;
@@ -1512,8 +1589,8 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
             BOOST_LOG_TRIVIAL(debug) << "GCode substitution: flushing final color chunk ("
                 << color_chunk.size() << " bytes), final layer_content ("
                 << layer_content.size() << " bytes)";
-            flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, scope.current_extruder());
-            flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer, scope.current_extruder());
+            flush_color_chunk(color_chunk, color_rules, layer_content, modified, parser_ptr, in_layer, in_preprint, scope.current_extruder());
+            flush_layer_chunk(layer_content, layer_rules, out.f, modified, parser_ptr, in_layer, in_preprint, scope.current_extruder());
 
             BOOST_LOG_TRIVIAL(debug) << "GCode substitution: processed " << layer_count
                 << " layers";

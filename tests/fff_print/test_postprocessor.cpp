@@ -1216,3 +1216,319 @@ SCENARIO("GCode Substitution: CP TOOLCHANGE robust tool splitting", "[PostProces
         std::filesystem::remove(out_path);
     }
 }
+
+SCENARIO("GCode Substitution: P flag — PrePrint section targeting", "[PostProcessor]") {
+    // P-flagged rules: run ONLY on PrePrint section (between EXECUTABLE_BLOCK_START and first LAYER_CHANGE).
+    // Non-P rules: run ONLY on layer/color chunks (skip PrePrint).
+    // M-flagged rules: run ONLY on preamble/suffix (skip PrePrint).
+
+    GIVEN("P flag is parsed correctly") {
+        auto config = make_config("s/old/new/P");
+        auto rules = parse_gcode_substitution_rules(config);
+        THEN("rule has preprint_only set") {
+            REQUIRE(rules[0].preprint_only == true);
+        }
+        AND_THEN("rule has metadata_only false") {
+            REQUIRE(rules[0].metadata_only == false);
+        }
+    }
+
+    GIVEN("P flag without M or C") {
+        auto config = make_config("s/old/new/P");
+        auto rules = parse_gcode_substitution_rules(config);
+        THEN("rule is parsed without error") {
+            REQUIRE(rules.size() == 1);
+        }
+    }
+
+    GIVEN("P flag combined with M flag (conflicting)") {
+        auto config = make_config("s/old/new/PM");
+        THEN("RuntimeError is thrown") {
+            REQUIRE_THROWS_AS(parse_gcode_substitution_rules(config), Slic3r::RuntimeError);
+        }
+    }
+
+    GIVEN("P flag combined with C flag (conflicting)") {
+        auto config = make_config("s/old/new/PC");
+        THEN("RuntimeError is thrown") {
+            REQUIRE_THROWS_AS(parse_gcode_substitution_rules(config), Slic3r::RuntimeError);
+        }
+    }
+
+    GIVEN("P-flagged rule matches in PrePrint section") {
+        std::string input =
+            "; EXECUTABLE_BLOCK_START\n"
+            "G1 E10\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/P");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("only PrePrint is substituted, layer is not") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            // PrePrint E10 should be replaced.
+            REQUIRE(output.find("EXECUTABLE_BLOCK_START\nG1 E100\n") != std::string::npos);
+            // Layer E10 should remain unchanged.
+            REQUIRE(output.find(";LAYER_CHANGE\nG1 E10\n") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("P-flagged rule does NOT match in preamble") {
+        std::string input =
+            "G1 E10\n"
+            "; EXECUTABLE_BLOCK_START\n"
+            "G1 E10\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/P");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("only PrePrint is substituted, preamble is not") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            // Preamble E10 should remain unchanged.
+            REQUIRE(output.find("G1 E10\n; EXECUTABLE_BLOCK_START\n") != std::string::npos);
+            // PrePrint E10 should be replaced.
+            REQUIRE(output.find("EXECUTABLE_BLOCK_START\nG1 E100\n") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("P-flagged rule does NOT match in layer chunks") {
+        std::string input =
+            "; EXECUTABLE_BLOCK_START\n"
+            "G1 E10\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/P");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("only PrePrint is substituted, layer is not") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            // PrePrint E10 should be replaced.
+            REQUIRE(output.find("EXECUTABLE_BLOCK_START\nG1 E100\n") != std::string::npos);
+            // Layer E10 should remain unchanged.
+            REQUIRE(output.find(";LAYER_CHANGE\nG1 E10\n") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("P-flagged rule does NOT match in suffix") {
+        std::string input =
+            "; EXECUTABLE_BLOCK_START\n"
+            "G1 E10\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n"
+            "; EXECUTABLE_BLOCK_END\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/P");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("only PrePrint is substituted, suffix is not") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            // PrePrint E10 should be replaced.
+            REQUIRE(output.find("EXECUTABLE_BLOCK_START\nG1 E100\n") != std::string::npos);
+            // Suffix E10 should remain unchanged.
+            REQUIRE(output.find("; EXECUTABLE_BLOCK_END\nG1 E10\n") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("non-P rule does NOT match in PrePrint") {
+        std::string input =
+            "; EXECUTABLE_BLOCK_START\n"
+            "G1 E10\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("only layer is substituted, PrePrint is not") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            // PrePrint E10 should remain unchanged.
+            REQUIRE(output.find("EXECUTABLE_BLOCK_START\nG1 E10\n") != std::string::npos);
+            // Layer E10 should be replaced.
+            REQUIRE(output.find(";LAYER_CHANGE\nG1 E100\n") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("M-flagged rule does NOT match in PrePrint") {
+        std::string input =
+            "; EXECUTABLE_BLOCK_START\n"
+            "G1 E10\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/M");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("PrePrint is not substituted by M rule") {
+            REQUIRE(modified == false);
+            std::string output = read_file_content(out_path);
+            // PrePrint E10 should remain unchanged.
+            REQUIRE(output.find("EXECUTABLE_BLOCK_START\nG1 E10\n") != std::string::npos);
+            // Layer E10 should remain unchanged.
+            REQUIRE(output.find(";LAYER_CHANGE\nG1 E10\n") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("both P and M rules on same file") {
+        std::string input =
+            "G1 E10\n"
+            "; EXECUTABLE_BLOCK_START\n"
+            "G1 E10\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n"
+            "; EXECUTABLE_BLOCK_END\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        // P rule replaces E10 with E200 in PrePrint.
+        // M rule replaces E10 with E300 in preamble/suffix.
+        // Non-P rule replaces E10 with E100 in layer chunks.
+        auto config = make_config("s/E10/E200/P\ns/E10/E300/M\ns/E10/E100/");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("each rule type matches only its designated section") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            // Preamble: M rule applied (E10 -> E300).
+            REQUIRE(output.find("G1 E300\n; EXECUTABLE_BLOCK_START\n") != std::string::npos);
+            // PrePrint: P rule applied (E10 -> E200).
+            REQUIRE(output.find("EXECUTABLE_BLOCK_START\nG1 E200\n") != std::string::npos);
+            // Layer: non-P rule applied (E10 -> E100).
+            REQUIRE(output.find(";LAYER_CHANGE\nG1 E100\n") != std::string::npos);
+            // Suffix: M rule applied (E10 -> E300).
+            REQUIRE(output.find("; EXECUTABLE_BLOCK_END\nG1 E300\n") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("T command in PrePrint does not corrupt buffer order") {
+        std::string input =
+            "; EXECUTABLE_BLOCK_START\n"
+            "T0\n"
+            "G1 E10\n"
+            ";LAYER_CHANGE\n"
+            "G1 E20\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/P");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("G-code order is preserved and PrePrint is substituted") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            // Verify order: EXECUTABLE_BLOCK_START, T0, substituted E100, LAYER_CHANGE, E20
+            REQUIRE(output.find("EXECUTABLE_BLOCK_START\nT0\nG1 E100\n;LAYER_CHANGE\nG1 E20\n") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("PrePrint without EXECUTABLE_BLOCK_START — no PrePrint section") {
+        std::string input =
+            "G1 E10\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/P");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("P rule does not match (no PrePrint section)") {
+            REQUIRE(modified == false);
+            std::string output = read_file_content(out_path);
+            // E10 should remain unchanged everywhere.
+            REQUIRE(output.find("G1 E10\n") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("macro variable {layer_num} resolves to -1 in PrePrint with P flag") {
+        std::string input =
+            "; EXECUTABLE_BLOCK_START\n"
+            "G1 E10\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E{layer_num}/P");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("layer_num resolves to -1 in PrePrint") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            // PrePrint E10 should be replaced with E-1.
+            REQUIRE(output.find("EXECUTABLE_BLOCK_START\nG1 E-1\n") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+}
