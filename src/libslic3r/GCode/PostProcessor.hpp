@@ -44,6 +44,8 @@ struct GCodeSubRule
     bool metadata_only = false;
     // P flag — preprint-only mode (PrePrint section only, between EXECUTABLE_BLOCK_START and first LAYER_CHANGE).
     bool preprint_only = false;
+    // R flag — run/don't run condition (boolean expression evaluated per chunk via PlaceholderParser).
+    std::optional<std::string> condition;
 };
 
 // Parse the raw substitution config options into a vector of GCodeSubRule.

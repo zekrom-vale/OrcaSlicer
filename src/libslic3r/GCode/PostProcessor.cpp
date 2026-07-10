@@ -382,6 +382,34 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
                     block_type = GCodeSubBlockType::Color;
                 rule.block_type = block_type;
 
+                // Parse R flag — run/don't run condition.
+                // Format: R{layer_num > 5 && current_extruder == 0}
+                // Parsed first and erased from flags so downstream M/P/conflict checks
+                // don't match characters inside the R{...} block.
+                {
+                    size_t rpos = flags.find('R');
+                    if (rpos != std::string::npos) {
+                        // Ensure the very next character is the open brace.
+                        if (rpos + 1 < flags.size() && flags[rpos + 1] == '{') {
+                            size_t brace_close = flags.find('}', rpos + 2);
+                            if (brace_close != std::string::npos) {
+                                // Extract the condition.
+                                rule.condition = flags.substr(rpos + 2, brace_close - rpos - 2);
+                                // Erase the entire R{...} block from flags so downstream
+                                // checks (M/P parsing, section-mode conflict, unknown-flag
+                                // warning) don't match characters inside the condition.
+                                flags.erase(rpos, brace_close - rpos + 1);
+                            } else {
+                                throw Slic3r::RuntimeError(Slic3r::format(
+                                    "GCode substitution failed. Unclosed brace in R condition: %1%", line));
+                            }
+                        } else {
+                            throw Slic3r::RuntimeError(Slic3r::format(
+                                "GCode substitution failed. Missing '{' after R flag: %1%", line));
+                        }
+                    }
+                }
+
                 // Parse M flag — metadata-only mode (preamble/suffix only).
                 bool has_M = flags.find('M') != std::string::npos;
                 rule.metadata_only = has_M;
@@ -410,7 +438,7 @@ std::vector<GCodeSubRule> parse_gcode_substitution_rules(const ConfigBase &confi
                     }
                 }
 
-                // Warn on unknown flags — known flags: i, n, c, m, s, f, x, C, M, P.
+                // Warn on unknown flags — known flags: i, n, c, m, s, f, x, C, M, P, R.
                 for (char fc : flags) {
                     if (fc != 'i' && fc != 'n' && fc != 'c' && fc != 'm' &&
                         fc != 's' && fc != 'f' && fc != 'x' && fc != 'C' && fc != 'M' && fc != 'P') {
@@ -1021,6 +1049,23 @@ static bool apply_rule_to_string(GCodeSubRule &rule, std::string &src,
     return apply_substitution_rule(rule, src);
 }
 
+// Evaluate the run/don't run condition for a rule.
+// Returns true if the rule should be applied (condition met or no condition).
+// Returns false if the condition evaluates to false or errors out.
+static bool evaluate_rule_condition(
+    const std::optional<std::string>& condition,
+    const DynamicConfig& config,
+    const DynamicConfig* config_override)
+{
+    if (!condition) return true; // no condition = always run
+    try {
+        return PlaceholderParser::evaluate_boolean_expression(*condition, config, config_override);
+    } catch (const Slic3r::PlaceholderParserError& e) {
+        BOOST_LOG_TRIVIAL(warning) << "GCode substitution: condition evaluation failed: " << e.what();
+        return false; // on error, skip the rule (safe default)
+    }
+}
+
 // Apply rules to a string buffer. Updates modified flag if any rule matched.
 // M-flagged (metadata_only) rules run ONLY on preamble/suffix (in_layer=false, in_preprint=false).
 // P-flagged (preprint_only) rules run ONLY on PrePrint section (in_preprint=true).
@@ -1059,6 +1104,15 @@ static void apply_rules_to_string(
             cfg.erase("current_extruder");
 
         for (auto *rule : rules) {
+            // R flag — evaluate run/don't run condition.
+            if (rule->condition && parser) {
+                if (!evaluate_rule_condition(rule->condition, parser->config(), nullptr))
+                    continue;
+            } else if (rule->condition && !parser) {
+                // No parser available — shouldn't happen if we create parser for conditions.
+                // Safe default: skip the rule.
+                continue;
+            }
             // M-flagged rules: run ONLY on preamble/suffix (skip when in layer or PrePrint).
             if (rule->metadata_only && (in_layer || in_preprint))
                 continue;
@@ -1080,6 +1134,15 @@ static void apply_rules_to_string(
     }
     else {
         for (auto *rule : rules) {
+            // R flag — evaluate run/don't run condition.
+            if (rule->condition && parser) {
+                if (!evaluate_rule_condition(rule->condition, parser->config(), nullptr))
+                    continue;
+            } else if (rule->condition && !parser) {
+                // No parser available — shouldn't happen if we create parser for conditions.
+                // Safe default: skip the rule.
+                continue;
+            }
             // M-flagged rules: run ONLY on preamble/suffix (skip when in layer or PrePrint).
             if (rule->metadata_only && (in_layer || in_preprint))
                 continue;
@@ -1190,6 +1253,7 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
         std::vector<GCodeSubRule*> layer_rules;  // L flag or no flag — apply per layer chunk
         std::vector<GCodeSubRule*> color_rules;  // C flag — apply per color chunk
         bool any_macros = false;
+        bool any_condition = false;
 
         for (auto &rule : all_rules) {
             if (rule.block_type == GCodeSubBlockType::Color)
@@ -1198,6 +1262,8 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
                 layer_rules.push_back(&rule);
             if (rule.macro_meta.has_macros)
                 any_macros = true;
+            if (rule.condition)
+                any_condition = true;
         }
 
         if (layer_rules.empty() && color_rules.empty())
@@ -1208,8 +1274,9 @@ bool apply_gcode_substitutions(const std::string &in_path, const std::string &ou
         // (nozzle_temperature, filament_type, total_layer_count, max_z_height,
         // filament_density, filament_diameter, etc.) without needing to extract
         // them from the G-code header.
+        // Parser is also needed when any rule has an R condition (for variable resolution).
         PlaceholderParser parser(&config);
-        PlaceholderParser* parser_ptr = any_macros ? &parser : nullptr;
+        PlaceholderParser* parser_ptr = (any_macros || any_condition) ? &parser : nullptr;
 
         bool modified = false;
 

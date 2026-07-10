@@ -1532,3 +1532,232 @@ SCENARIO("GCode Substitution: P flag — PrePrint section targeting", "[PostProc
         std::filesystem::remove(out_path);
     }
 }
+
+SCENARIO("GCode Substitution: R flag — Run/Don't Run condition", "[PostProcessor]") {
+    GIVEN("R flag parses condition string correctly") {
+        auto config = make_config("s/OLD/NEW/R{layer_num > 5}");
+        auto rules = parse_gcode_substitution_rules(config);
+        THEN("one rule is returned with condition set") {
+            REQUIRE(rules.size() == 1);
+            REQUIRE(rules[0].condition.has_value());
+            REQUIRE(rules[0].condition.value() == "layer_num > 5");
+        }
+    }
+
+    GIVEN("R flag with combined condition") {
+        auto config = make_config("s/OLD/NEW/R{layer_num > 5 && current_extruder == 0}");
+        auto rules = parse_gcode_substitution_rules(config);
+        THEN("condition string is extracted fully") {
+            REQUIRE(rules.size() == 1);
+            REQUIRE(rules[0].condition.value() == "layer_num > 5 && current_extruder == 0");
+        }
+    }
+
+    GIVEN("no R flag — condition is nullopt") {
+        auto config = make_config("s/OLD/NEW/");
+        auto rules = parse_gcode_substitution_rules(config);
+        THEN("condition is not set") {
+            REQUIRE(rules.size() == 1);
+            REQUIRE(!rules[0].condition.has_value());
+        }
+    }
+
+    GIVEN("unclosed brace in R condition") {
+        auto config = make_config("s/OLD/NEW/R{layer_num > 5");
+        THEN("RuntimeError is thrown") {
+            REQUIRE_THROWS_AS(parse_gcode_substitution_rules(config), Slic3r::RuntimeError);
+        }
+    }
+
+    GIVEN("R flag without opening brace") {
+        auto config = make_config("s/OLD/NEW/Rlayer_num > 5");
+        THEN("RuntimeError is thrown") {
+            REQUIRE_THROWS_AS(parse_gcode_substitution_rules(config), Slic3r::RuntimeError);
+        }
+    }
+
+    GIVEN("R flag with condition that evaluates to true") {
+        // layer_num = 0 (first layer), condition: layer_num >= 0 → true
+        std::string input =
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/R{layer_num >= 0}");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("substitution is applied because condition is true") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            REQUIRE(output.find("E100") != std::string::npos);
+            REQUIRE(output.find("E10") == std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("R flag with condition that evaluates to false") {
+        // layer_num = 0 (first layer), condition: layer_num > 5 → false
+        std::string input =
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/R{layer_num > 5}");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("substitution is skipped because condition is false") {
+            REQUIRE(modified == false);
+            std::string output = read_file_content(out_path);
+            REQUIRE(output.find("E10") != std::string::npos);
+            REQUIRE(output.find("E100") == std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("R flag with first_layer condition") {
+        // layer_num = 0, condition: first_layer → true
+        std::string input =
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/R{first_layer}");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("substitution is applied on first layer") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            REQUIRE(output.find("E100") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("R flag with !first_layer condition on first layer") {
+        // layer_num = 0, condition: !first_layer → false
+        std::string input =
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/R{!first_layer}");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("substitution is skipped on first layer") {
+            REQUIRE(modified == false);
+            std::string output = read_file_content(out_path);
+            REQUIRE(output.find("E10") != std::string::npos);
+            REQUIRE(output.find("E100") == std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("R flag combined with M flag") {
+        // M flag: metadata-only (preamble/suffix). R flag: condition.
+        // Condition true, but M flag means it only runs on preamble.
+        std::string input =
+            "G1 E10\n"
+            "; EXECUTABLE_BLOCK_START\n"
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/R{layer_num >= 0}M");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("M flag still restricts to preamble/suffix even with R condition") {
+            REQUIRE(modified == true);
+            std::string output = read_file_content(out_path);
+            // Preamble: substituted (M flag + condition true)
+            REQUIRE(output.find("G1 E100\n; EXECUTABLE_BLOCK_START\n") != std::string::npos);
+            // Layer: NOT substituted (M flag blocks it)
+            REQUIRE(output.find(";LAYER_CHANGE\nG1 E10\n") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("R flag with no unknown-flag warnings for brace content") {
+        // This test verifies that the R{...} content doesn't trigger
+        // unknown flag warnings. We just need to confirm parsing succeeds
+        // without errors for a complex condition.
+        auto config = make_config("s/OLD/NEW/R{layer_num > 5 && current_extruder == 0 && layer_height < 0.2}");
+        auto rules = parse_gcode_substitution_rules(config);
+        THEN("rule parses without error and condition is correct") {
+            REQUIRE(rules.size() == 1);
+            REQUIRE(rules[0].condition.value() == "layer_num > 5 && current_extruder == 0 && layer_height < 0.2");
+        }
+    }
+
+    GIVEN("R flag with ternary expression in condition") {
+        // Ternary: layer_num > 5 ? 1 : 0 → evaluates to 0 (false) on first layer
+        std::string input =
+            ";LAYER_CHANGE\n"
+            "G1 E10\n";
+        std::string in_path = create_temp_file(input);
+        std::string out_path = in_path + ".out";
+
+        auto config = make_config("s/E10/E100/R{layer_num > 5 ? 1 : 0}");
+        auto rules = parse_gcode_substitution_rules(config);
+
+        bool modified = apply_gcode_substitutions(in_path, out_path, std::move(rules), config);
+
+        THEN("ternary evaluates to 0 (false) on first layer, rule skipped") {
+            REQUIRE(modified == false);
+            std::string output = read_file_content(out_path);
+            REQUIRE(output.find("E10") != std::string::npos);
+        }
+
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(out_path);
+    }
+
+    GIVEN("R condition with M/C/P characters does not trigger section-mode conflict") {
+        // The condition expression contains 'M' and 'P' characters.
+        // These should NOT be treated as section-mode flags.
+        // This verifies that R{...} is properly erased before M/P/conflict checks.
+        auto config = make_config("s/OLD/NEW/R{M > 5 && P < 10}");
+        auto rules = parse_gcode_substitution_rules(config);
+        THEN("rule parses without section-mode conflict error") {
+            REQUIRE(rules.size() == 1);
+            REQUIRE(rules[0].condition.value() == "M > 5 && P < 10");
+            // M and P flags should NOT be set — they were inside R{...}.
+            REQUIRE(rules[0].metadata_only == false);
+            REQUIRE(rules[0].preprint_only == false);
+        }
+    }
+
+    GIVEN("R condition with M character does not set metadata_only") {
+        // The condition expression contains 'M'. Without R{...} erasure,
+        // the M flag check would incorrectly set metadata_only = true.
+        auto config = make_config("s/OLD/NEW/R{M > 0}");
+        auto rules = parse_gcode_substitution_rules(config);
+        THEN("metadata_only is false despite M in condition") {
+            REQUIRE(rules.size() == 1);
+            REQUIRE(rules[0].metadata_only == false);
+        }
+    }
+}
