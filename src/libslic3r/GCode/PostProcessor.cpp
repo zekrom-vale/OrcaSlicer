@@ -1772,11 +1772,36 @@ static bool run_post_process_impl(std::string &src_path, bool make_copy, const s
                 std::string resolved;
                 const ConfigOption *opt = enriched_config.option(key);
                 if (opt) {
-                    try {
-                        resolved = opt->serialize();
-                    } catch (...) {
-                        resolved = "<error>";
+                    if (opt->is_vector()) {
+                        // For vector types, use vserialize() to get individual elements.
+                        // This avoids a single bad element (e.g., NaN in non-nullable types)
+                        // causing the entire serialization to fail.
+                        const ConfigOptionVectorBase *vec = static_cast<const ConfigOptionVectorBase *>(opt);
+                        try {
+                            auto elems = vec->vserialize();
+                            resolved = "[";
+                            for (size_t i = 0; i < elems.size(); ++i) {
+                                if (i > 0)
+                                    resolved += ", ";
+                                resolved += elems[i];
+                            }
+                            resolved += "]";
+                        } catch (const ConfigurationError &e) {
+                            resolved = std::string("<Vector Error: ") + e.what() + ">";
+                        } catch (...) {
+                            resolved = "<Vector Error>";
+                        }
+                    } else {
+                        try {
+                            resolved = opt->serialize();
+                        } catch (const ConfigurationError &e) {
+                            resolved = std::string("<") + e.what() + ">";
+                        } catch (...) {
+                            resolved = "<error>";
+                        }
                     }
+                } else {
+                    resolved = "<Null Option>";
                 }
                 dump_content += "  " + key;
                 // Pad key to align values.
