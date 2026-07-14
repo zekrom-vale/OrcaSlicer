@@ -1684,15 +1684,27 @@ static bool run_post_process_impl(std::string &src_path, bool make_copy, const s
 {
     const auto *post_process = enriched_config.opt<ConfigOptionStrings>("post_process");
 
-    // Check for _DEBUG_MACRO master key — if gcode_substitutions contains only
-    // "_DEBUG_MACRO" (with optional whitespace), trigger debug mode instead.
-    const auto *print_subs = enriched_config.option<ConfigOptionString>("gcode_substitutions");
+    // Check for _DEBUG_MACRO master key — if gcode_substitutions or
+    // printer_gcode_substitutions contains "_DEBUG_MACRO" at the start of
+    // any line, write resolved config to <src_path>.gcode.dump as a side effect
+    // (does not block normal flow).
     bool debug_macro = false;
-    if (print_subs) {
-        std::string trimmed = print_subs->value;
-        boost::trim(trimmed);
-        debug_macro = (trimmed == "_DEBUG_MACRO");
-    }
+
+    // (?m)   : Multiline mode — ^ and $ match at line boundaries, not just string boundaries
+    // ^      : Start of a line
+    // \s*    : Zero or more whitespace
+    // $      : End of the line
+    static const boost::regex debug_macro_expr("(?m)^\\s*_DEBUG_MACRO\\s*$");
+
+    auto check_debug_macro = [&debug_macro](const ConfigOptionString *subs) {
+        if (!subs || subs->value.empty()) return;
+        if (boost::regex_search(subs->value, debug_macro_expr)) {
+            debug_macro = true;
+        }
+    };
+    check_debug_macro(enriched_config.option<ConfigOptionString>("gcode_substitutions"));
+    if (!debug_macro)
+        check_debug_macro(enriched_config.option<ConfigOptionString>("printer_gcode_substitutions"));
 
     // Parse all substitution rules — applied via chunked post-processing.
     auto sub_rules = parse_gcode_substitution_rules(enriched_config);
@@ -1703,13 +1715,16 @@ static bool run_post_process_impl(std::string &src_path, bool make_copy, const s
     if (!had_sub_rules && !has_scripts && !debug_macro)
         return false;
 
+    // debug_macro is now a side effect — it does not block normal flow.
+    // It writes a .gcode.dump file with resolved config values.
+
     BOOST_LOG_TRIVIAL(debug) << "run_post_process: make_copy=" << make_copy
         << " sub_rules_count=" << sub_rules.size()
         << " has_scripts=" << has_scripts
         << " debug_macro=" << debug_macro;
 
     // Determine output path: .pp for isolated copy (make_copy), original for in-place.
-    std::string tmp_path = make_copy || had_sub_rules || debug_macro ? (src_path + ".pp") : src_path;
+    std::string tmp_path = make_copy || had_sub_rules ? (src_path + ".pp") : src_path;
 
     try {
         // Remove stale temp file if it exists.
@@ -1725,56 +1740,6 @@ static bool run_post_process_impl(std::string &src_path, bool make_copy, const s
             // Read from original, write directly to tmp_path — no intermediate copy.
             apply_gcode_substitutions(src_path, tmp_path, std::move(sub_rules), enriched_config);
         }
-        // --- Step 1b: Debug macro — prepend resolved macro values as comments ---
-        else if (debug_macro) {
-            // Copy source to tmp_path first.
-            std::string error_message;
-            if (copy_file(src_path, tmp_path, error_message, false) != SUCCESS)
-                throw Slic3r::RuntimeError(Slic3r::format("Failed copying G-code file %1%: %2%", src_path, error_message));
-
-            // Resolve all config keys and prepend as comments.
-            PlaceholderParser parser(&enriched_config);
-            std::string debug_header = "G4 P0 ; DEBUG_MACRO: resolved macro values\n";
-            for (const auto &key : enriched_config.keys()) {
-                std::string macro = "{" + key + "}";
-                try {
-                    std::string resolved = parser.process(macro);
-                    debug_header += "G4 P0 ; DEBUG_MACRO: " + key + " = " + resolved + "\n";
-                } catch (...) {
-                    debug_header += "G4 P0 ; DEBUG_MACRO: " + key + " = <error>\n";
-                }
-            }
-            debug_header += "G4 P0 ; DEBUG_MACRO: end\n";
-
-            // Prepend debug header using streaming — write header to a new temp file,
-            // then stream the original file content using a small fixed-size buffer to
-            // avoid loading the entire G-code file into memory.
-            {
-                std::string streaming_tmp = tmp_path + ".debug_tmp";
-                {
-                    // Open original file for reading.
-                    FilePtr fin{ boost::nowide::fopen(tmp_path.c_str(), "rb") };
-                    // Open new file for writing.
-                    FilePtr fout{ boost::nowide::fopen(streaming_tmp.c_str(), "wb") };
-                    if (fin.f && fout.f) {
-                        // Write debug header first.
-                        fwrite(debug_header.data(), 1, debug_header.size(), fout.f);
-                        // Stream file content with a small fixed-size buffer.
-                        char buffer[4096];
-                        size_t bytes_read;
-                        while ((bytes_read = fread(buffer, 1, sizeof(buffer), fin.f)) > 0) {
-                            fwrite(buffer, 1, bytes_read, fout.f);
-                        }
-                    }
-                }
-                // Replace original with the new file containing the header.
-                boost::filesystem::remove(tmp_path);
-                boost::filesystem::rename(streaming_tmp, tmp_path);
-            }
-
-            BOOST_LOG_TRIVIAL(info) << "GCode substitution: prepended DEBUG_MACRO header with "
-                << enriched_config.keys().size() << " resolved variables";
-        }
         // --- Step 2: If no rules but isolation needed, make a plain copy ---
         else if (make_copy) {
             std::string error_message;
@@ -1782,6 +1747,59 @@ static bool run_post_process_impl(std::string &src_path, bool make_copy, const s
                 throw Slic3r::RuntimeError(Slic3r::format("Failed making a temporary copy of G-code file %1%: %2%", src_path, error_message));
         }
         // else: no rules and no isolation — nothing to do for step 1/2.
+
+        // --- Step 2b: Debug macro — write resolved config to .gcode.dump ---
+        if (debug_macro) {
+            // Use output_name (final destination) so the dump file isn't orphaned in /tmp.
+            // Fall back to src_path if output_name is empty (e.g., non-File host).
+            std::string dump_path = (!output_name.empty() ? output_name : src_path) + ".gcode.dump";
+
+            // Find the maximum key length for alignment.
+            size_t max_key_len = 0;
+            for (const auto &key : enriched_config.keys()) {
+                if (key.size() > max_key_len)
+                    max_key_len = key.size();
+            }
+
+            std::string separator(max_key_len + 8, '=');
+
+            std::string dump_content;
+            dump_content += separator + "\n";
+            dump_content += "  DEBUG_MACRO - Resolved Configuration\n";
+            dump_content += separator + "\n";
+
+            for (const auto &key : enriched_config.keys()) {
+                std::string resolved;
+                const ConfigOption *opt = enriched_config.option(key);
+                if (opt) {
+                    try {
+                        resolved = opt->serialize();
+                    } catch (...) {
+                        resolved = "<error>";
+                    }
+                }
+                dump_content += "  " + key;
+                // Pad key to align values.
+                size_t padding = max_key_len - key.size();
+                for (size_t i = 0; i < padding; ++i)
+                    dump_content += ' ';
+                dump_content += " = " + resolved + "\n";
+            }
+
+            dump_content += separator + "\n";
+
+            // Write dump file.
+            {
+                FilePtr fout{ boost::nowide::fopen(dump_path.c_str(), "w") };
+                if (fout.f) {
+                    fwrite(dump_content.data(), 1, dump_content.size(), fout.f);
+                } else {
+                    BOOST_LOG_TRIVIAL(error) << Slic3r::format("Failed opening debug dump file %1%", dump_path);
+                }
+            }
+
+            BOOST_LOG_TRIVIAL(info) << "DEBUG_MACRO: wrote resolved config to " << dump_path;
+        }
 
         // --- Step 3: Run post-processing scripts ---
         if (has_scripts) {
@@ -1793,18 +1811,28 @@ static bool run_post_process_impl(std::string &src_path, bool make_copy, const s
             // In-place: move the src path
             src_path = std::move(tmp_path);
         }
-        else if (had_sub_rules || debug_macro) {
+        else if (had_sub_rules) {
             // In-place: rename .tmp over original.
             boost::filesystem::rename(tmp_path, src_path);
         }
     } catch (...) {
         // Clean up temp file on error.
-        if (had_sub_rules || debug_macro || make_copy) {
+        if (had_sub_rules || make_copy) {
             try {
                 if (boost::filesystem::exists(tmp_path))
                     boost::filesystem::remove(tmp_path);
             } catch (const std::exception &err) {
                 BOOST_LOG_TRIVIAL(error) << Slic3r::format("Failed deleting temporary G-code file %1% on error: %2%", tmp_path, err.what());
+            }
+        }
+        // Clean up debug dump file on error.
+        if (debug_macro) {
+            std::string dump_path = (!output_name.empty() ? output_name : src_path) + ".gcode.dump";
+            try {
+                if (boost::filesystem::exists(dump_path))
+                    boost::filesystem::remove(dump_path);
+            } catch (const std::exception &err) {
+                BOOST_LOG_TRIVIAL(error) << Slic3r::format("Failed deleting debug dump file %1% on error: %2%", dump_path, err.what());
             }
         }
         throw;

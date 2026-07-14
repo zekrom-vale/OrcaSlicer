@@ -1118,7 +1118,16 @@ static constexpr const char* gcode_substitutions_common_doc =
 "  s/M104 S220/M104 S220 ; PREPRINT/P/           Target PrePrint section only\n"
 "  s/(;\\s*(?:HEADER_BLOCK|CONFIG_BLOCK))_(START|END)/${1}_${2} ; PREAMBLE/M\n"
 "  s/M83/M83 ; PREPRINT/P\n"
-"  s/G1 E(.*)/G1 E${1} ; LAYER/                      Three-way test: M for preamble, P for PrePrint, default for layers";
+"  s/G1 E(.*)/G1 E${1} ; LAYER/                      Three-way test: M for preamble, P for PrePrint, default for layers\n"
+"═══════════════════════════════════════════════════════════\n"
+"SPECIAL VALUES\n"
+"═══════════════════════════════════════════════════════════\n"
+"  _DEBUG_MACRO — When gcode_substitutions begins with '_DEBUG_MACRO' on the\n"
+"  first line, a formatted dump of all resolved config macros is written to\n"
+"  <output_file>.gcode.dump as a side effect. This does not modify the G-code\n"
+"  file or block normal post-processing. Additional substitution rules on\n"
+"  subsequent lines are still processed normally.\n"
+"  The dump file uses aligned key-value formatting for readability.";
 
 void PrintConfigDef::init_fff_params()
 {

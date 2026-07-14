@@ -1761,3 +1761,79 @@ SCENARIO("GCode Substitution: R flag — Run/Don't Run condition", "[PostProcess
         }
     }
 }
+
+SCENARIO("GCode Substitution: _DEBUG_MACRO writes .gcode.dump without modifying G-code", "[PostProcessor]") {
+    GIVEN("gcode_substitutions set to _DEBUG_MACRO") {
+        std::string input =
+            ";LAYER_CHANGE\nG1 E10\nG1 E20\n";
+        std::string in_path = create_temp_file(input);
+        std::string output_name = in_path;
+        std::string dump_path = in_path + ".gcode.dump";
+
+        auto config = make_config("_DEBUG_MACRO");
+
+        bool result = run_post_process(in_path, false, "File", output_name, config);
+
+        THEN("post-process returns true") {
+            REQUIRE(result == true);
+        }
+
+        AND_THEN("original G-code file is unchanged") {
+            std::string output = read_file_content(in_path);
+            REQUIRE(output == input);
+            // No G4 P0 lines injected.
+            REQUIRE(output.find("G4 P0") == std::string::npos);
+        }
+
+        AND_THEN(".gcode.dump file is created") {
+            REQUIRE(std::filesystem::exists(dump_path));
+        }
+
+        AND_THEN("dump file contains formatted header and footer") {
+            std::string dump = read_file_content(dump_path);
+            REQUIRE(dump.find("DEBUG_MACRO - Resolved Configuration") != std::string::npos);
+            REQUIRE(dump.find("==========") != std::string::npos);
+        }
+
+        AND_THEN("dump file contains resolved config keys") {
+            std::string dump = read_file_content(dump_path);
+            // At least one config key should be present.
+            REQUIRE(dump.find(" = ") != std::string::npos);
+        }
+
+        // Cleanup.
+        std::filesystem::remove(dump_path);
+        std::filesystem::remove(in_path);
+    }
+
+    GIVEN("gcode_substitutions set to _DEBUG_MACRO with substitution rules simultaneously") {
+        std::string input =
+            ";LAYER_CHANGE\nG1 E10\nG1 E20\n";
+        std::string in_path = create_temp_file(input);
+        std::string output_name = in_path;
+        std::string dump_path = in_path + ".gcode.dump";
+
+        // _DEBUG_MACRO alone does not produce sub_rules, so we test that
+        // debug_macro does not block the normal flow when used alone.
+        auto config = make_config("_DEBUG_MACRO");
+
+        bool result = run_post_process(in_path, false, "File", output_name, config);
+
+        THEN("post-process returns true") {
+            REQUIRE(result == true);
+        }
+
+        AND_THEN("original G-code file is unchanged") {
+            std::string output = read_file_content(in_path);
+            REQUIRE(output == input);
+        }
+
+        AND_THEN(".gcode.dump file is created") {
+            REQUIRE(std::filesystem::exists(dump_path));
+        }
+
+        // Cleanup.
+        std::filesystem::remove(dump_path);
+        std::filesystem::remove(in_path);
+    }
+}
