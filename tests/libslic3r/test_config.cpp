@@ -229,6 +229,79 @@ SCENARIO("Config ini load/save interface", "[Config]") {
     }
 }
 
+SCENARIO("escape_string_cstyle / unescape_string_cstyle round-trip", "[Config]") {
+    // Regression: unescape_string_cstyle consumed backslash for unrecognized escape sequences
+    // like \s, \d, \G, \D, causing regex patterns in G-code post-processors to be corrupted.
+    WHEN("A string with recognized escape sequences is escaped and unescaped") {
+        std::string original = "hello\r\nworld";
+        std::string escaped = escape_string_cstyle(original);
+        std::string unescaped;
+        REQUIRE(unescape_string_cstyle(escaped, unescaped));
+        THEN("The round-trip preserves the original value") {
+            REQUIRE(unescaped == original);
+        }
+    }
+    WHEN("A string with backslashes is escaped and unescaped") {
+        std::string original = "path\\to\\file";
+        std::string escaped = escape_string_cstyle(original);
+        std::string unescaped;
+        REQUIRE(unescape_string_cstyle(escaped, unescaped));
+        THEN("The round-trip preserves the original value") {
+            REQUIRE(unescaped == original);
+        }
+    }
+    WHEN("A string with double quotes is escaped and unescaped") {
+        std::string original = "say \"hello\"";
+        std::string escaped = escape_string_cstyle(original);
+        std::string unescaped;
+        REQUIRE(unescape_string_cstyle(escaped, unescaped));
+        THEN("The round-trip preserves the original value") {
+            REQUIRE(unescaped == original);
+        }
+    }
+    WHEN("A string with unrecognized escape sequences like \\s, \\d, \\G, \\D is unescaped") {
+        std::string original = "s/(?:(^;\\s*filament_colour_type\\s*=\\s*)|\\G\\D)(\\d+)/${1}${2},/M/";
+        // These are NOT C-style escape sequences, so unescape should preserve the backslashes.
+        std::string unescaped;
+        REQUIRE(unescape_string_cstyle(original, unescaped));
+        THEN("The backslashes are preserved") {
+            REQUIRE(unescaped == original);
+        }
+    }
+    WHEN("A string with a trailing backslash is unescaped") {
+        std::string original = "path\\";
+        std::string unescaped;
+        REQUIRE(unescape_string_cstyle(original, unescaped));
+        THEN("The trailing backslash is preserved") {
+            REQUIRE(unescaped == original);
+        }
+    }
+    WHEN("A regex pattern with multiple backslash sequences is unescaped") {
+        std::string original = "s/(^;\\s*filament_colour_type\\s*=\\s*(?:,?\\d+)+)[^\\n\\d]/${1}/M/";
+        std::string unescaped;
+        REQUIRE(unescape_string_cstyle(original, unescaped));
+        THEN("Only \\n is unescaped (to real newline), other backslashes preserved") {
+            // \\n -> \n (real newline), \\s -> \s, \\d -> \d, \\D -> \D
+            std::string expected = "s/(^;\\s*filament_colour_type\\s*=\\s*(?:,?\\d+)+)[^\n\\d]/${1}/M/";
+            REQUIRE(unescaped == expected);
+        }
+    }
+}
+
+SCENARIO("escape_strings_cstyle / unescape_strings_cstyle round-trip", "[Config]") {
+    WHEN("A vector of strings with backslashes is escaped and unescaped") {
+        std::vector<std::string> original = {"path\\to\\file", "hello\\nworld"};
+        std::string escaped = escape_strings_cstyle(original);
+        std::vector<std::string> unescaped;
+        REQUIRE(unescape_strings_cstyle(escaped, unescaped));
+        THEN("The round-trip preserves the original values") {
+            REQUIRE(unescaped.size() == original.size());
+            REQUIRE(unescaped[0] == original[0]);
+            REQUIRE(unescaped[1] == original[1]);
+        }
+    }
+}
+
 // TODO: https://github.com/SoftFever/OrcaSlicer/issues/11269 - Is this test still relevant? Delete if not.
 // It was failing so at least "nozzle_type" and "extruder_printable_area" could not be serialized
 // and an exception was thrown, but "nozzle_type" has been around for at least 3 months now.

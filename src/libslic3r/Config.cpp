@@ -120,6 +120,8 @@ std::string escape_strings_cstyle(const std::vector<std::string> &strs)
 }
 
 // Unescape double quotes, \n, \r and backslash
+// Inverse of escape_string_cstyle(): handles \r, \n, \\, and \" only.
+// Unrecognized escape sequences (e.g. \s, \d) preserve the backslash.
 bool unescape_string_cstyle(const std::string &str, std::string &str_out)
 {
     std::vector<char> out(str.size(), 0);
@@ -127,15 +129,25 @@ bool unescape_string_cstyle(const std::string &str, std::string &str_out)
     for (size_t i = 0; i < str.size(); ++ i) {
         char c = str[i];
         if (c == '\\') {
-            if (++ i == str.size())
-                return false;
-            c = str[i];
-            if (c == 'r')
-                (*outptr ++) = '\r';
-            else if (c == 'n')
-                (*outptr ++) = '\n';
-            else
-                (*outptr ++) = c;
+            if (++ i == str.size()) {
+                // Trailing backslash — preserve it.
+                (*outptr ++) = '\\';
+            } else {
+                c = str[i];
+                if (c == 'r')
+                    (*outptr ++) = '\r';
+                else if (c == 'n')
+                    (*outptr ++) = '\n';
+                else if (c == '\\')
+                    (*outptr ++) = '\\';
+                else if (c == '"')
+                    (*outptr ++) = '"';
+                else {
+                    // Unrecognized escape sequence — preserve the backslash.
+                    (*outptr ++) = '\\';
+                    (*outptr ++) = c;
+                }
+            }
         } else
             (*outptr ++) = c;
     }
@@ -171,13 +183,24 @@ bool unescape_strings_cstyle(const std::string &str, std::vector<std::string> &o
                     break;
                 }
                 if (c == '\\') {
-                    if (++ i == str.size())
-                        return false;
-                    c = str[i];
-                    if (c == 'r')
-                        c = '\r';
-                    else if (c == 'n')
-                        c = '\n';
+                    if (++ i == str.size()) {
+                        // Trailing backslash — preserve it.
+                        buf.push_back('\\');
+                    } else {
+                        c = str[i];
+                        if (c == 'r')
+                            c = '\r';
+                        else if (c == 'n')
+                            c = '\n';
+                        else if (c == '\\')
+                            c = '\\';
+                        else if (c == '"')
+                            c = '"';
+                        else {
+                            // Unrecognized escape sequence — preserve the backslash.
+                            buf.push_back('\\');
+                        }
+                    }
                 }
                 buf.push_back(c);
             }
