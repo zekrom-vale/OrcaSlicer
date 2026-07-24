@@ -6379,7 +6379,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                     warning_message += "-" + *it + "\n";
                                 warning_message += "\n";
                                 //show_info(q, _L("The 3MF has the following modified G-code in filament or printer presets:") + warning_message + _L("Please confirm that all modified G-code is safe to prevent any damage to the machine!"), _L("Modified G-code"));
-                                MessageDialog dlg(q, _L("The 3MF has the following modified G-code in filament or printer presets:") + warning_message + _L("Please confirm that all modified G-code is safe to prevent any damage to the machine!"), _L("Modified G-code"));
+                                MessageDialog dlg(q, _L("The 3MF has the following modified G-code in process, filament, or printer presets (including G-code templates and G-code substitutions):") + warning_message + _L("Please confirm that all modified G-code is safe to prevent any damage to the machine!"), _L("Modified G-code"));
                                 dlg.show_dsa_button();
                                 auto  res = dlg.ShowModal();
                                 if (dlg.get_checkbox_state())

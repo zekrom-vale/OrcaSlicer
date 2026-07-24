@@ -1847,21 +1847,21 @@ int PresetCollection::get_differed_values_to_update(Preset& preset, std::map<std
     return 0;
 }
 
-// Security: strip dangerous regex G-code substitution keys from configs loaded from
-// untrusted .3mf project files to prevent arbitrary command injection via embedded
-// printer/process/filament presets.
+// Security: detect dangerous regex G-code substitution keys in configs loaded from
+// untrusted .3mf project files. The keys are NOT stripped here — they flow through
+// to validate_presets() which checks gcodes_key_set and triggers the native UI warning.
+// This allows the user to review and accept the substitutions, just like custom G-code.
 void PresetCollection::sanitize_imported_project_config(DynamicPrintConfig& config)
 {
-    static const std::array<const char*, 2> kBlacklistedKeys = {
+    static const std::array<const char*, 2> kDangerousSubstitutionKeys = {
         "gcode_substitutions",
         "printer_gcode_substitutions",
     };
 
-    for (const char* key : kBlacklistedKeys) {
+    for (const char* key : kDangerousSubstitutionKeys) {
         if (config.has(key)) {
-            config.erase(key);
-            BOOST_LOG_TRIVIAL(warning) << "Dropped unverified G-code substitution key \"" << key
-                                       << "\" from untrusted .3mf project preset.";
+            BOOST_LOG_TRIVIAL(warning) << "Detected G-code substitution key \"" << key
+                                       << "\" in imported .3mf project preset — user will be warned.";
         }
     }
 }

@@ -1980,7 +1980,8 @@ void PresetBundle::update_system_preset_setting_ids(std::map<std::string, std::m
 
 //BBS: validate printers from previous project
 static std::set<std::string> gcodes_key_set =  {"filament_end_gcode", "filament_start_gcode", "change_filament_gcode", "layer_change_gcode", "machine_end_gcode", "machine_pause_gcode", "machine_start_gcode",
-            "template_custom_gcode", "printing_by_object_gcode", "before_layer_change_gcode", "time_lapse_gcode", "wrapping_detection_gcode"};
+            "template_custom_gcode", "printing_by_object_gcode", "before_layer_change_gcode", "time_lapse_gcode", "wrapping_detection_gcode",
+            "gcode_substitutions", "printer_gcode_substitutions"};
 int PresetBundle::validate_presets(const std::string &file_name, DynamicPrintConfig& config, std::set<std::string>& different_gcodes)
 {
     bool    validated = false;
@@ -2023,6 +2024,39 @@ int PresetBundle::validate_presets(const std::string &file_name, DynamicPrintCon
             BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(":file_name %1%, found the filament %2% preset not inherit from system") % file_name %(index+1);
             different_gcodes.emplace(filament_preset);
             ret = VALIDATE_PRESETS_FILAMENTS_NOT_FOUND;
+        }
+    }
+
+    // Manual check: gcode_substitutions and printer_gcode_substitutions are Print-level
+    // (Process) settings that the automated loop below skips (it only iterates
+    // filament-level differences at indices 1..filament_count-1).
+    // Check Print-level differences (index 0) the same way the loop checks filaments.
+    // This must run BEFORE the early return below, otherwise it is skipped when
+    // printer/filament validation fails (custom presets path).
+    {
+        std::vector<std::string> print_different_keys;
+        Slic3r::unescape_strings_cstyle(different_values[0], print_different_keys);
+        for (const std::string& key : print_different_keys) {
+            // gcode_substitutions belongs in the process preset. Skip printer_gcode_substitutions
+            // here - it belongs in the printer preset and is checked below.
+            if (gcodes_key_set.find(key) != gcodes_key_set.end() && key != "printer_gcode_substitutions") {
+                different_gcodes.emplace(key);
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(":print preset, different key %1%") %key;
+            }
+        }
+    }
+    // Also check printer-level differences (index num_filaments + 1) for
+    // printer_gcode_substitutions, which lives in the printer preset.
+    {
+        std::vector<std::string> printer_different_keys;
+        Slic3r::unescape_strings_cstyle(different_values[filament_count + 1], printer_different_keys);
+        for (const std::string& key : printer_different_keys) {
+            // printer_gcode_substitutions belongs in the printer preset. Skip gcode_substitutions
+            // here - it belongs in the process preset and is checked above.
+            if (gcodes_key_set.find(key) != gcodes_key_set.end() && key != "gcode_substitutions") {
+                different_gcodes.emplace(key);
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(":printer preset, different key %1%") %key;
+            }
         }
     }
 
